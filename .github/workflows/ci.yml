@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-evaluate:
+    name: Test & Benchmark (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit & integration test suite (M0-M6)
+        env:
+          PYTHONPATH: src:.
+        run: |
+          python3 -m unittest discover -s tests -v
+
+      - name: Run synthetic benchmark evaluation gate
+        env:
+          PYTHONPATH: src:.
+        run: |
+          python3 -m mcp_flow evaluate
+          python3 -c '
+          from scenarios.synthetic_suite import run_full_evaluation
+          data = run_full_evaluation()
+          for stage in data["stages"]:
+              assert stage["negative_fp"] == 0, f"Negative FP detected in {stage}"
+              assert stage["precision"] == 1.0, f"Precision regression in {stage}"
+          assert data["stages"][-1]["recall"] == 1.0, "Full stage recall regression"
+          print("Evaluation gate passed: 100% precision, 0 negative false positives.")
+          '
