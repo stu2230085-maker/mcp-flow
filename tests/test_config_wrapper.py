@@ -1,4 +1,5 @@
-Failed to connect to user scope bus via local transport: Operation not permitted (consider using --machine=<user>@.host --user to connect to bus of other user)
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -54,6 +55,41 @@ class ConfigWrapperTests(unittest.TestCase):
             self.assertEqual(os.stat(backup).st_mode & 0o777, 0o600)
             self.assertEqual(main(["wrap-config", str(path), "--unwrap"]), 0)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), self.config)
+
+    def test_cli_top_level_db_applies_to_wrap_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(self.config), encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = main(["--db", "custom.db", "wrap-config", str(path), "--session", "s1", "--dry-run"])
+            self.assertEqual(rc, 0)
+            rendered = json.loads(stdout.getvalue())
+            docs_args = rendered["mcpServers"]["docs"]["args"]
+            db_idx = docs_args.index("--db")
+            self.assertEqual(docs_args[db_idx + 1], "custom.db")
+
+    def test_wraps_server_with_proxy_and_module_args_without_false_positive(self):
+        config = {
+            "mcpServers": {
+                "custom": {
+                    "command": "python3",
+                    "args": ["-m", "other_pkg", "proxy", "--", "-m", "mcp_flow", "proxy"],
+                }
+            }
+        }
+        wrapped = wrap_mcp_config(config, session_id="s1", db_path="trace.db")
+        custom = wrapped["mcpServers"]["custom"]
+        self.assertEqual(custom["command"], "python3")
+        self.assertEqual(
+            custom["args"],
+            [
+                "-m", "mcp_flow", "--db", "trace.db", "proxy",
+                "--session", "s1", "--server", "custom", "--",
+                "python3", "-m", "other_pkg", "proxy", "--", "-m", "mcp_flow", "proxy",
+            ],
+        )
+        self.assertEqual(unwrap_mcp_config(wrapped), config)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-Failed to connect to user scope bus via local transport: Operation not permitted (consider using --machine=<user>@.host --user to connect to bus of other user)
 """Command-line interface (`mcp-flow`) implemented with standard library `argparse`."""
 
 from __future__ import annotations
@@ -6,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -23,6 +24,22 @@ from mcp_flow.proxy.stdio_proxy import run_stdio_proxy
 from mcp_flow.server.mcp_server import run_stdio_mcp_server
 from mcp_flow.store.db import FlowStore
 from mcp_flow.store.redaction import RedactionPolicy
+
+
+def _atomic_write_bytes(target: Path, data: bytes, mode: int) -> None:
+    """Write *data* to a temp file in *target.parent* with *mode* and replace *target*."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        os.chmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def analyze_session(
@@ -130,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_wrap.add_argument("config_json_path", help="MCP client JSON configuration file")
     p_wrap.add_argument("--session", help="Session ID (generated when omitted)")
-    p_wrap.add_argument("--db", dest="config_db", default="mcp_flow.db", help="Local SQLite database path")
+    p_wrap.add_argument("--db", dest="config_db", default=None, help="Local SQLite database path")
     p_wrap.add_argument("--servers", help="Comma-separated MCP server names to target")
     p_wrap.add_argument("--unwrap", action="store_true", help="Restore original commands")
     p_wrap.add_argument("--dry-run", action="store_true", help="Print transformed JSON without writing")
@@ -164,13 +181,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.servers is not None
                 else None
             )
+            db_path = args.config_db if args.config_db is not None else args.db
             if args.unwrap:
                 transformed = unwrap_mcp_config(config, servers=selected)
             else:
                 transformed = wrap_mcp_config(
                     config,
                     session_id=args.session or uuid.uuid4().hex,
-                    db_path=args.config_db,
+                    db_path=db_path,
                     servers=selected,
                 )
             rendered = json.dumps(transformed, indent=2, ensure_ascii=False) + "\n"
@@ -181,11 +199,9 @@ def main(argv: list[str] | None = None) -> int:
                 print("Configuration unchanged.")
                 return 0
             backup = Path(str(path) + ".bak")
-            if not backup.exists():
-                fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(original_bytes)
-            path.write_text(rendered, encoding="utf-8")
+            _atomic_write_bytes(backup, original_bytes, 0o600)
+            target_mode = stat.S_IMODE(path.stat().st_mode) or 0o600
+            _atomic_write_bytes(path, rendered.encode("utf-8"), target_mode)
             print(f"Updated {path}; backup: {backup}")
             return 0
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:

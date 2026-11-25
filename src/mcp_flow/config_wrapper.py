@@ -1,4 +1,3 @@
-Failed to connect to user scope bus via local transport: Operation not permitted (consider using --machine=<user>@.host --user to connect to bus of other user)
 """Transform MCP client JSON configuration files for the stdio proxy."""
 
 from __future__ import annotations
@@ -10,14 +9,16 @@ from typing import Any, Iterable
 def _is_wrapped(entry: dict[str, Any]) -> bool:
     command = entry.get("command")
     args = entry.get("args", [])
-    return (
-        isinstance(command, str)
-        and isinstance(args, list)
-        and "-m" in args
-        and args.index("-m") + 1 < len(args)
-        and args[args.index("-m") + 1] == "mcp_flow"
-        and "proxy" in args
-        and "--" in args
+    if not isinstance(command, str) or not isinstance(args, list):
+        return False
+    try:
+        marker = args.index("--")
+    except ValueError:
+        return False
+    wrapper_args = args[:marker]
+    return "proxy" in wrapper_args and any(
+        wrapper_args[i : i + 2] == ["-m", "mcp_flow"]
+        for i in range(len(wrapper_args) - 1)
     )
 
 
