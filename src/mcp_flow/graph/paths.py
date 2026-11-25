@@ -59,6 +59,20 @@ def find_hazardous_paths(
     ]
 
     for start_node in source_nodes:
+        cross_session_labels = [
+            lbl for lbl in start_node.labels if lbl.startswith("cross_session:")
+        ]
+        if start_node.role == sink_role and cross_session_labels:
+            results.append(
+                HazardousPath(
+                    nodes=[start_node],
+                    edges=[],
+                    bottleneck_score=1.0,
+                    weakest_edge_id="cross_session",
+                    source_labels=cross_session_labels,
+                )
+            )
+
         stack: list[tuple[int, list[CallNode], list[CallEdge]]] = [
             (start_node.call_id, [start_node], [])
         ]

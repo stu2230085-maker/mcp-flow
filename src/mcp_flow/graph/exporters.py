@@ -116,6 +116,10 @@ def format_cli_report(
             f"(weakest={hp.weakest_edge_id}) labels={','.join(hp.source_labels)}"
         )
         lines.append(f"  Route: {chain}")
+        if not hp.edges and any(lbl.startswith("cross_session:") for lbl in hp.source_labels):
+            lines.append(
+                "  Provenance: cross-session taint matched input fragment(s) from earlier session(s)"
+            )
         for edge in hp.edges:
             src_node = graph.nodes[edge.src_call_id]
             dst_node = graph.nodes[edge.dst_call_id]
