@@ -22,7 +22,6 @@ _DIRECTION_ALIASES: dict[str, str] = {
     "client->server": "c2s",
     "request": "c2s",
     "outbound": "c2s",
-    "in": "c2s",
     "->": "c2s",
     "s2c": "s2c",
     "server_to_client": "s2c",
@@ -30,7 +29,6 @@ _DIRECTION_ALIASES: dict[str, str] = {
     "server->client": "s2c",
     "response": "s2c",
     "inbound": "s2c",
-    "out": "s2c",
     "<-": "s2c",
 }
 
@@ -44,7 +42,9 @@ class ImportResult:
     servers: list[str]
 
 
-def _normalize_timestamp(raw_ts: Any, fallback_base: float, index: int) -> float:
+def _normalize_timestamp(
+    raw_ts: Any, fallback_base: float, index: int, line_no: int | None = None
+) -> float:
     if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool):
         return float(raw_ts)
     if isinstance(raw_ts, str):
@@ -55,7 +55,11 @@ def _normalize_timestamp(raw_ts: Any, fallback_base: float, index: int) -> float
             except ValueError:
                 pass
             iso = text[:-1] + "+00:00" if text.endswith("Z") else text
-            dt = datetime.fromisoformat(iso)
+            try:
+                dt = datetime.fromisoformat(iso)
+            except ValueError as exc:
+                prefix = f"Line {line_no}: " if line_no is not None else ""
+                raise ValueError(f"{prefix}invalid timestamp {raw_ts!r}") from exc
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
@@ -117,6 +121,40 @@ def _extract_rpc_metadata(
     return kind, method, rpc_id
 
 
+def _extract_server_name(record: dict[str, Any]) -> str:
+    for key in ("server", "server_name"):
+        raw_val = record.get(key)
+        if raw_val is not None and not isinstance(raw_val, bool):
+            text = str(raw_val).strip()
+            if text:
+                return text
+
+    raw_sid = record.get("server_id")
+    if raw_sid is None:
+        return "default"
+    raw_server_id = str(raw_sid).strip()
+    if not raw_server_id:
+        return "default"
+
+    rec_session_id = record.get("session_id")
+    if rec_session_id is not None and not isinstance(rec_session_id, bool):
+        rec_sid_text = str(rec_session_id).strip()
+        if rec_sid_text:
+            prefix = f"{rec_sid_text}:"
+            if raw_server_id.startswith(prefix):
+                remainder = raw_server_id[len(prefix) :].strip()
+                if remainder:
+                    return remainder
+
+    if ":" in raw_server_id:
+        _, right = raw_server_id.split(":", 1)
+        right_text = right.strip()
+        if right_text:
+            return right_text
+
+    return raw_server_id
+
+
 def import_trace_jsonl(
     store: FlowStore,
     jsonl_path: str | Path,
@@ -138,7 +176,9 @@ def import_trace_jsonl(
             raise ValueError(f"Line {line_no}: JSONL record must be a JSON object")
         records.append((line_no, parsed))
 
-    resolved_session = session_id
+    resolved_session = (
+        session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+    )
     if not resolved_session:
         for _, rec in records:
             cand = rec.get("session_id")
@@ -150,60 +190,63 @@ def import_trace_jsonl(
         resolved_session = stem or f"import-{uuid.uuid4().hex[:8]}"
 
     fallback_base = time.time()
-    first_ts = (
-        _normalize_timestamp(
-            records[0][1].get("ts") if "ts" in records[0][1] else records[0][1].get("timestamp"),
-            fallback_base,
-            0,
-        )
-        if records
-        else fallback_base
-    )
-    store.ensure_session(
-        resolved_session,
-        client="import",
-        note=f"Imported from {path.name}",
-        started_at=first_ts,
-    )
+    servers_to_register: dict[str, str] = {}
+    server_names_order: list[str] = []
+    seen_server_names: set[str] = set()
+    prepared_messages: list[
+        tuple[str, str, str, str, str | None, str | None, str, float]
+    ] = []
 
-    registered_servers: dict[str, str] = {}
     for idx, (line_no, rec) in enumerate(records):
         body_str = _normalize_body(rec, line_no)
         kind, method, rpc_id = _extract_rpc_metadata(rec, body_str)
         direction = _normalize_direction(rec, kind, line_no)
 
         raw_ts = rec.get("ts") if "ts" in rec else rec.get("timestamp")
-        ts = _normalize_timestamp(raw_ts, fallback_base, idx)
+        ts = _normalize_timestamp(raw_ts, fallback_base, idx, line_no=line_no)
 
-        raw_server_name = rec.get("server") or rec.get("server_name") or rec.get("server_id") or "default"
-        raw_server_id = rec.get("server_id") or raw_server_name
-        server_id = str(raw_server_id)
-        server_name = str(raw_server_name)
+        server_name = _extract_server_name(rec)
+        server_id = f"{resolved_session}:{server_name}"
 
-        if server_id not in registered_servers:
-            store.register_server(
-                server_id=server_id,
-                session_id=resolved_session,
-                name=server_name,
-                transport="import",
+        if server_id not in servers_to_register:
+            servers_to_register[server_id] = server_name
+        if server_name not in seen_server_names:
+            seen_server_names.add(server_name)
+            server_names_order.append(server_name)
+
+        prepared_messages.append(
+            (
+                resolved_session,
+                server_id,
+                direction,
+                kind,
+                method,
+                rpc_id,
+                body_str,
+                ts,
             )
-            registered_servers[server_id] = server_name
-
-        store.append_message(
-            session_id=resolved_session,
-            server_id=server_id,
-            direction=direction,
-            kind=kind,
-            method=method,
-            rpc_id=rpc_id,
-            body=body_str,
-            ts=ts,
         )
+
+    first_ts = prepared_messages[0][7] if prepared_messages else fallback_base
+    store.ensure_session(
+        resolved_session,
+        client="import",
+        note=f"Imported from {path.name}",
+        started_at=first_ts,
+    )
+    for srv_id, srv_name in servers_to_register.items():
+        store.register_server(
+            server_id=srv_id,
+            session_id=resolved_session,
+            name=srv_name,
+            transport="import",
+        )
+    imported_count = store.append_messages_batch(prepared_messages)
 
     return ImportResult(
         session_id=resolved_session,
-        imported_messages=len(records),
-        servers=list(registered_servers.keys()),
+        imported_messages=imported_count,
+        servers=server_names_order,
     )
 
 
@@ -247,6 +290,17 @@ def export_otel_spans(
             }
             for edge in incoming_edges.get(node.call_id, [])
         ]
+        attributes: dict[str, Any] = {
+            "mcp.call_id": node.call_id,
+            "mcp.server": node.server_name,
+            "mcp.tool": node.tool,
+            "mcp.role": node.role,
+            "mcp.labels": list(node.labels),
+            "mcp.req_seq": node.req_seq,
+        }
+        if node.res_seq is not None:
+            attributes["mcp.res_seq"] = node.res_seq
+
         spans.append(
             {
                 "trace_id": trace_id,
@@ -258,15 +312,7 @@ def export_otel_spans(
                 "status": {
                     "code": "STATUS_CODE_ERROR" if node.is_error else "STATUS_CODE_OK"
                 },
-                "attributes": {
-                    "mcp.call_id": node.call_id,
-                    "mcp.server": node.server_name,
-                    "mcp.tool": node.tool,
-                    "mcp.role": node.role,
-                    "mcp.labels": list(node.labels),
-                    "mcp.req_seq": node.req_seq,
-                    "mcp.res_seq": node.res_seq,
-                },
+                "attributes": attributes,
                 "links": links,
             }
         )
