@@ -14,16 +14,18 @@
 - [Architecture](#architecture)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-- [CLI Reference (All 8 Subcommands)](#cli-reference-all-8-subcommands)
+- [CLI Reference (All 10 Subcommands)](#cli-reference-all-10-subcommands)
   - [Global Options](#global-options)
   - [1. `proxy` — Record `stdio` or Streamable HTTP Traffic](#1-proxy--record-stdio-or-streamable-http-traffic)
   - [2. `analyze` — Recompute Derived Layers & Flows](#2-analyze--recompute-derived-layers--flows)
   - [3. `report` — Detect Hazardous Data-Flow Paths](#3-report--detect-hazardous-data-flow-paths)
   - [4. `graph` — Export Call Dependency Graphs](#4-graph--export-call-dependency-graphs)
   - [5. `label` — Attach Manual Confidentiality Labels](#5-label--attach-manual-confidentiality-labels)
-  - [6. `export` — Export Immutable Raw Messages (JSONL)](#6-export--export-immutable-raw-messages-jsonl)
-  - [7. `serve-mcp` — Read-Only MCP Inspection Server](#7-serve-mcp--read-only-mcp-inspection-server)
-  - [8. `evaluate` — Run the Synthetic Benchmark Suite](#8-evaluate--run-the-synthetic-benchmark-suite)
+  - [6. `export` — Export Raw Messages (JSONL) or OpenTelemetry Spans](#6-export--export-raw-messages-jsonl-or-opentelemetry-spans)
+  - [7. `import` — Import JSONL or `mcptape` Traces](#7-import--import-jsonl-or-mcptape-traces)
+  - [8. `serve-mcp` — Read-Only MCP Inspection Server](#8-serve-mcp--read-only-mcp-inspection-server)
+  - [9. `evaluate` — Run the Synthetic Benchmark Suite](#9-evaluate--run-the-synthetic-benchmark-suite)
+  - [10. `wrap-config` — Auto-Wrap or Unwrap MCP Client Configs](#10-wrap-config--auto-wrap-or-unwrap-mcp-client-configs)
 - [Custom Confidentiality Rules & Secret Detectors](#custom-confidentiality-rules--secret-detectors)
 - [Security & Privacy Model](#security--privacy-model)
 - [Synthetic Benchmark Evaluation](#synthetic-benchmark-evaluation)
@@ -117,7 +119,15 @@ PYTHONPATH=src python3 -m mcp_flow --help
 
 ### 1. Wrap any MCP Server in your Client Configuration
 
-Replace your MCP server command with `python3 -m mcp_flow proxy` (or `mcp-flow proxy` if installed):
+The easiest way to wrap an existing MCP client configuration (such as Claude Desktop or Cursor) is with [`mcp-flow wrap-config`](#10-wrap-config--auto-wrap-or-unwrap-mcp-client-configs), which automatically wraps `mcpServers` entries, writes a `0600` `.bak` backup, and can be reversed anytime with `--unwrap`:
+
+```bash
+# Preview changes without modifying disk, then apply
+python3 -m mcp_flow wrap-config ~/.config/claude/claude_desktop_config.json --session work-session-01 --db /path/to/mcp_flow.db --dry-run
+python3 -m mcp_flow wrap-config ~/.config/claude/claude_desktop_config.json --session work-session-01 --db /path/to/mcp_flow.db
+```
+
+Alternatively, replace your MCP server command manually with `python3 -m mcp_flow proxy` (or `mcp-flow proxy` if installed):
 
 ```json
 {
@@ -180,7 +190,7 @@ graph LR
 
 ---
 
-## CLI Reference (All 8 Subcommands)
+## CLI Reference (All 10 Subcommands)
 
 ```text
 mcp-flow [--db DB_PATH] <subcommand> [options]
@@ -241,12 +251,14 @@ Clears and recomputes all derived tables (`calls`, `fragments`, `flows`, and rul
 | `--enable-semantic` | `False` | Explicitly opt in to Stage 5 semantic similarity matching. |
 | `--min-score FLOAT` | `0.35` | Minimum confidence score (`0.0`–`1.0`) required to record a candidate flow edge. |
 | `--rules PATH` | `None` | Path to a custom JSON rules file defining tool roles and confidentiality labels. |
+| `--persist-labels` | `False` | Record hash-only fingerprints of sensitive output fragments for cross-session tracking. |
+| `--cross-session` | `False` | Match input fragments against persistent fingerprints from earlier sessions. |
 
 **Example:**
 
 ```bash
-# Re-analyze a session up to Stage 5 (semantic) with custom tool role rules
-mcp-flow --db trace.db analyze sess-01 --max-stage 5 --enable-semantic --rules my_rules.json
+# Re-analyze a session up to Stage 5 (semantic) with custom tool role rules and cross-session tracking
+mcp-flow --db trace.db analyze sess-01 --max-stage 5 --enable-semantic --rules my_rules.json --persist-labels --cross-session
 ```
 
 ---
@@ -264,6 +276,7 @@ Builds the session's call-level dependency graph and enumerates directed paths f
 | `--format {text,json}` | `text` | Output format (`text` human-readable report or structured `json`). |
 | `--expose-text` | `False` | Include raw fragment text snippets in the output (omitted by default for safety). |
 | `--recompute` | `False` | Force full recomputation of derived data before generating the report. |
+| `--cross-session` | `False` | Enable cross-session taint matching when recomputing or matching against prior persistent fingerprints. |
 
 **Example:**
 
@@ -312,24 +325,46 @@ mcp-flow --db trace.db label --target-kind call --target-id 1 --label "confident
 
 ---
 
-### 6. `export` — Export Immutable Raw Messages (JSONL)
+### 6. `export` — Export Raw Messages (JSONL) or OpenTelemetry Spans
 
-Exports all recorded raw JSON-RPC messages for a session in newline-delimited JSON (JSONL) format for archiving or external interoperability.
+Exports all recorded raw JSON-RPC messages for a session as newline-delimited JSON (`jsonl`), or exports derived tool calls and flow dependencies as OpenTelemetry Span JSON (`otel`) for external observability tooling.
 
 | Argument / Option | Default | Description |
 | :--- | :--- | :--- |
 | `session` | *(required)* | Target session ID to export. |
-| `--out PATH` | `stdout` | Output `.jsonl` file path (prints to `stdout` if omitted). |
+| `--format {jsonl,otel}` | `jsonl` | Output format (`jsonl` raw messages or `otel` OpenTelemetry Span JSON). |
+| `--out PATH` | `stdout` | Output file path (prints to `stdout` if omitted). |
 
-**Example:**
+**Examples:**
 
 ```bash
-mcp-flow --db trace.db export sess-01 --out sess-01-messages.jsonl
+# Export immutable raw JSON-RPC messages as JSONL
+mcp-flow --db trace.db export sess-01 --format jsonl --out sess-01-messages.jsonl
+
+# Export derived calls and flows as OpenTelemetry Span JSON
+mcp-flow --db trace.db export sess-01 --format otel --out sess-01-otel.json
 ```
 
 ---
 
-### 7. `serve-mcp` — Read-Only MCP Inspection Server
+### 7. `import` — Import JSONL or `mcptape` Traces
+
+Imports `mcp-flow` JSONL exports or `mcptape`-compatible JSONL trace recordings into the local `messages` table for offline flow analysis.
+
+| Argument / Option | Default | Description |
+| :--- | :--- | :--- |
+| `jsonl_file` | *(required)* | Path to the JSONL trace file to import. |
+| `--session ID` | `None` | Override the session ID for imported messages (uses the trace's session ID or generates one when omitted). |
+
+**Example:**
+
+```bash
+mcp-flow --db trace.db import recordings/sample.jsonl --session imported-sess-01
+```
+
+---
+
+### 8. `serve-mcp` — Read-Only MCP Inspection Server
 
 Runs a read-only MCP server over `stdio` so an AI agent or MCP client can inspect its own session's data-flow lineage.
 
@@ -345,7 +380,7 @@ Runs a read-only MCP server over `stdio` so an AI agent or MCP client can inspec
 
 ---
 
-### 8. `evaluate` — Run the Synthetic Benchmark Suite
+### 9. `evaluate` — Run the Synthetic Benchmark Suite
 
 Runs the built-in deterministic evaluation suite across all 5 fingerprint stages and prints Precision, Recall, F1, True/False Positives, and Negative Scenario False Positives.
 
@@ -357,6 +392,34 @@ Runs the built-in deterministic evaluation suite across all 5 fingerprint stages
 
 ```bash
 mcp-flow evaluate --format text
+```
+
+---
+
+### 10. `wrap-config` — Auto-Wrap or Unwrap MCP Client Configs
+
+Automatically wraps `mcpServers` entries in an MCP client JSON configuration file with `python3 -m mcp_flow proxy` (or restores original commands with `--unwrap`). Creates an atomic `0600` `.bak` backup before modifying the target configuration file.
+
+| Argument / Option | Default | Description |
+| :--- | :--- | :--- |
+| `config_json_path` | *(required)* | Path to the MCP client JSON configuration file. |
+| `--session ID` | *(generated)* | Session ID embedded in wrapped proxy commands (a UUID hex string is generated when omitted). |
+| `--db PATH` | `mcp_flow.db` | Local SQLite database path embedded in wrapped commands (inherits global `--db` if omitted). |
+| `--servers LIST` | `None` | Comma-separated list of MCP server names to target (targets all servers in `mcpServers` when omitted). |
+| `--unwrap` | `False` | Restore original server commands by removing generated `mcp-flow proxy` wrappers. |
+| `--dry-run` | `False` | Print the transformed JSON to `stdout` without writing files or backups. |
+
+**Examples:**
+
+```bash
+# Preview wrapped config without modifying disk
+mcp-flow wrap-config claude_desktop_config.json --session sess-01 --db /path/to/mcp_flow.db --dry-run
+
+# Wrap only specific servers (creates claude_desktop_config.json.bak with 0600 permissions)
+mcp-flow wrap-config claude_desktop_config.json --session sess-01 --servers docs,mail
+
+# Restore original server commands
+mcp-flow wrap-config claude_desktop_config.json --unwrap
 ```
 
 ---
