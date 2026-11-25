@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 from mcp_flow.derive.calls import derive_calls
+from mcp_flow.config_wrapper import unwrap_mcp_config, wrap_mcp_config
 from mcp_flow.derive.fragments import derive_fragments
 from mcp_flow.graph.builder import build_flow_graph
 from mcp_flow.graph.exporters import format_cli_report, to_dot, to_json_dict, to_mermaid
@@ -21,6 +26,22 @@ from mcp_flow.proxy.stdio_proxy import run_stdio_proxy
 from mcp_flow.server.mcp_server import run_stdio_mcp_server
 from mcp_flow.store.db import FlowStore
 from mcp_flow.store.redaction import RedactionPolicy
+
+
+def _atomic_write_bytes(target: Path, data: bytes, mode: int) -> None:
+    """Write *data* to a temp file in *target.parent* with *mode* and replace *target*."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        os.chmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def analyze_session(
@@ -147,6 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval = sub.add_parser("evaluate", help="Run synthetic scenarios and report stage-by-stage Precision/Recall/FPR")
     p_eval.add_argument("--format", choices=["text", "json"], default="text")
 
+    # 9. wrap-config
+    p_wrap = sub.add_parser(
+        "wrap-config", help="Wrap MCP client server commands with the recording proxy"
+    )
+    p_wrap.add_argument("config_json_path", help="MCP client JSON configuration file")
+    p_wrap.add_argument("--session", help="Session ID (generated when omitted)")
+    p_wrap.add_argument("--db", dest="config_db", default=None, help="Local SQLite database path")
+    p_wrap.add_argument("--servers", help="Comma-separated MCP server names to target")
+    p_wrap.add_argument("--unwrap", action="store_true", help="Restore original commands")
+    p_wrap.add_argument("--dry-run", action="store_true", help="Print transformed JSON without writing")
+
     return parser
 
 
@@ -163,6 +195,45 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_evaluation_report(metrics), end="")
         return 0
+
+    if args.subcommand == "wrap-config":
+        path = Path(args.config_json_path)
+        try:
+            original_bytes = path.read_bytes()
+            config = json.loads(original_bytes.decode("utf-8"))
+            if not isinstance(config, dict):
+                raise ValueError("Configuration root must be a JSON object")
+            selected = (
+                [name.strip() for name in args.servers.split(",") if name.strip()]
+                if args.servers is not None
+                else None
+            )
+            db_path = args.config_db if args.config_db is not None else args.db
+            if args.unwrap:
+                transformed = unwrap_mcp_config(config, servers=selected)
+            else:
+                transformed = wrap_mcp_config(
+                    config,
+                    session_id=args.session or uuid.uuid4().hex,
+                    db_path=db_path,
+                    servers=selected,
+                )
+            rendered = json.dumps(transformed, indent=2, ensure_ascii=False) + "\n"
+            if args.dry_run:
+                sys.stdout.write(rendered)
+                return 0
+            if transformed == config:
+                print("Configuration unchanged.")
+                return 0
+            backup = Path(str(path) + ".bak")
+            _atomic_write_bytes(backup, original_bytes, 0o600)
+            target_mode = stat.S_IMODE(path.stat().st_mode) or 0o600
+            _atomic_write_bytes(path, rendered.encode("utf-8"), target_mode)
+            print(f"Updated {path}; backup: {backup}")
+            return 0
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            print(f"mcp-flow wrap-config: {exc}", file=sys.stderr)
+            return 2
 
     redaction = RedactionPolicy.from_regex_strings(
         getattr(args, "redact_pattern", []),
