@@ -206,7 +206,7 @@ Transparently forwards JSON-RPC 2.0 traffic between an MCP client and an upstrea
 | `--target-url URL` | `None` | Upstream server endpoint URL (required when `--transport http`). |
 | `--port PORT` | `8765` | Local listen port when `--transport http`. |
 | `--hash-only` | `False` | Omit raw fragment text during derivation, storing only SHA-256 hashes and lengths. |
-| `--redact-pattern REGEX` | `[]` | Regex pattern to redact with `[REDACTED]` before writing to SQLite (repeatable). |
+| `--redact-pattern REGEX` | `[]` | Regex pattern to redact with `[REDACTED:PATTERN_<N>]` before writing to SQLite (repeatable). |
 | `-- <command...>` | — | Target MCP server command and arguments (required when `--transport stdio`). |
 
 **Examples:**
@@ -397,14 +397,14 @@ Pass a JSON file to `mcp-flow analyze <session> --rules custom_rules.json`:
 ### Built-In Content Detectors
 
 Regardless of tool names, `mcp-flow` inspects fragment strings for sensitive content patterns and propagates detected labels to originating tool calls:
-- `secret:api_key` (`sk-...`, `rk-...`, etc.)
+- `secret:api_key` (`sk-...`)
 - `secret:github_token` (`ghp_...`, `github_pat_...`)
-- `secret:aws_access_key` (`AKIA...`, `ASIA...`)
+- `secret:aws_key` (`AKIA...`, `ASIA...`)
 - `secret:jwt` (3-part Base64URL JWT tokens)
 - `secret:bearer_token` (`Bearer ...`)
 - `secret:private_key` (`-----BEGIN ... PRIVATE KEY-----`)
 - `pii:email` (RFC-style email addresses)
-- `confidential:doc` (`CONFIDENTIAL`, `INTERNAL ONLY`, `DO NOT DISTRIBUTE`, `社外秘`, `取扱注意`)
+- `confidential:doc` (`CONFIDENTIAL`, `INTERNAL_ONLY`, `SECRET_TOKEN`, `社外秘`, `機密文書`, `極秘`)
 
 ---
 
