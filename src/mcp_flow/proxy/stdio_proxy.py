@@ -13,37 +13,85 @@ from mcp_flow.proxy.jsonrpc import parse_jsonrpc_line
 from mcp_flow.store.db import FlowStore
 
 
+DEFAULT_BATCH_SIZE = 64
+
+
+def _write_all(dst: BinaryIO, data: bytes) -> None:
+    """Write all bytes in `data` to `dst`, handling partial writes on unbuffered streams."""
+    view = memoryview(data)
+    written = 0
+    total = len(view)
+    while written < total:
+        n = dst.write(view[written:])
+        if n is None or n == 0:
+            break
+        written += n
+    dst.flush()
+
+
 def _writer_worker(
     store: FlowStore,
     session_id: str,
     server_id: str,
     log_queue: queue.Queue[tuple[str, float, bytes] | None],
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> None:
-    """Background worker that persists captured JSON-RPC lines to SQLite without blocking I/O relay."""
+    """Background worker that persists captured JSON-RPC lines in batches without blocking I/O relay."""
+    effective_batch_size = max(1, batch_size)
     while True:
-        item = log_queue.get()
-        if item is None:
+        first_item = log_queue.get()
+        if first_item is None:
             log_queue.task_done()
             break
-        direction, ts, raw_bytes = item
+
+        raw_batch: list[tuple[str, float, bytes]] = [first_item]
+        stop_after_batch = False
+
+        while len(raw_batch) < effective_batch_size:
+            try:
+                next_item = log_queue.get_nowait()
+            except queue.Empty:
+                break
+            if next_item is None:
+                stop_after_batch = True
+                break
+            raw_batch.append(next_item)
+
         try:
-            text = raw_bytes.decode("utf-8", errors="replace")
-            for msg in parse_jsonrpc_line(text):
-                store.append_message(
-                    session_id=session_id,
-                    server_id=server_id,
-                    direction=direction,
-                    kind=msg.kind,
-                    method=msg.method,
-                    rpc_id=msg.rpc_id,
-                    body=msg.raw_body,
-                    ts=ts,
-                )
+            records: list[tuple[str, str, str, str, str | None, str | None, str, float]] = []
+            for direction, ts, raw_bytes in raw_batch:
+                try:
+                    text = raw_bytes.decode("utf-8", errors="replace")
+                    for msg in parse_jsonrpc_line(text):
+                        records.append(
+                            (
+                                session_id,
+                                server_id,
+                                direction,
+                                msg.kind,
+                                msg.method,
+                                msg.rpc_id,
+                                msg.raw_body,
+                                ts,
+                            )
+                        )
+                except Exception:
+                    # Passive observer must never crash the relay if a single frame fails to parse
+                    continue
+
+            if records:
+                store.append_messages_batch(records)
         except Exception:
             # Passive observer must never crash the relay if logging fails
             pass
         finally:
-            log_queue.task_done()
+            for _ in raw_batch:
+                log_queue.task_done()
+            if stop_after_batch:
+                log_queue.task_done()
+
+        if stop_after_batch:
+            break
 
 
 def _relay_stream(
@@ -60,8 +108,7 @@ def _relay_stream(
             if not chunk:
                 break
             ts = time.time()
-            dst.write(chunk)
-            dst.flush()
+            _write_all(dst, chunk)
             log_queue.put((direction, ts, chunk))
     except (BrokenPipeError, ValueError, OSError):
         pass
@@ -82,10 +129,11 @@ def run_stdio_proxy(
     client_in: BinaryIO | None = None,
     client_out: BinaryIO | None = None,
     client_name: str = "stdio-client",
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> int:
     """
     Launch an MCP server command as a subprocess and relay stdin/stdout transparently.
-    Every JSON-RPC message is recorded asynchronously into `store`.
+    Every JSON-RPC message is recorded asynchronously into `store` in batched SQLite transactions.
     """
     if not command:
         raise ValueError("Server command cannot be empty")
@@ -108,7 +156,7 @@ def run_stdio_proxy(
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=sys.stderr,
-        bufsize=0,
+        bufsize=-1,
     )
     assert proc.stdin is not None
     assert proc.stdout is not None
@@ -116,7 +164,7 @@ def run_stdio_proxy(
     log_queue: queue.Queue[tuple[str, float, bytes] | None] = queue.Queue()
     db_thread = threading.Thread(
         target=_writer_worker,
-        args=(store, session_id, actual_server_id, log_queue),
+        args=(store, session_id, actual_server_id, log_queue, batch_size),
         daemon=True,
     )
     db_thread.start()
