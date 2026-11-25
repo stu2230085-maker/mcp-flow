@@ -14,6 +14,7 @@ from mcp_flow.graph.exporters import format_cli_report, to_dot, to_json_dict, to
 from mcp_flow.graph.paths import find_hazardous_paths
 from mcp_flow.interop.trace_io import export_otel_spans, import_trace_jsonl
 from mcp_flow.labels.rules import LabelRuleEngine
+from mcp_flow.match.cross_session import match_cross_session_taint
 from mcp_flow.match.engine import FingerprintEngine
 from mcp_flow.proxy.http_proxy import StreamableHttpProxyServer
 from mcp_flow.proxy.stdio_proxy import run_stdio_proxy
@@ -29,6 +30,8 @@ def analyze_session(
     enable_semantic: bool = False,
     min_score: float = 0.35,
     rules_path: str | None = None,
+    persist_labels: bool = False,
+    cross_session: bool = False,
 ) -> None:
     """Recompute all derived data (`calls`, `fragments`, `flows`, `labels`) from immutable `messages`."""
     store.clear_derived_data(session_id)
@@ -45,7 +48,9 @@ def analyze_session(
         if rules_path
         else LabelRuleEngine()
     )
-    rule_engine.apply_to_session(store, session_id)
+    rule_engine.apply_to_session(store, session_id, persist_labels=persist_labels)
+    if cross_session:
+        match_cross_session_taint(store, session_id)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--enable-semantic", action="store_true", help="Enable Stage 5 semantic similarity")
     p_analyze.add_argument("--min-score", type=float, default=0.35)
     p_analyze.add_argument("--rules", help="Optional JSON rules file for tool roles and labels")
+    p_analyze.add_argument(
+        "--persist-labels",
+        action="store_true",
+        help="Record hash-only fingerprints of sensitive output fragments for cross-session tracking",
+    )
+    p_analyze.add_argument(
+        "--cross-session",
+        action="store_true",
+        help="Match input fragments against persistent fingerprints from earlier sessions",
+    )
 
     # 3. report
     p_report = sub.add_parser("report", help="Detect and report hazardous paths from confidential sources to sinks")
@@ -89,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--format", choices=["text", "json"], default="text")
     p_report.add_argument("--expose-text", action="store_true", help="Include raw fragment text snippets in output")
     p_report.add_argument("--recompute", action="store_true", help="Force recomputation before reporting")
+    p_report.add_argument(
+        "--cross-session",
+        action="store_true",
+        help="Enable cross-session taint matching when recomputing",
+    )
 
     # 4. graph
     p_graph = sub.add_parser("graph", help="Export call-level data dependency graph as Mermaid, DOT, or JSON")
@@ -184,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
                 enable_semantic=args.enable_semantic,
                 min_score=args.min_score,
                 rules_path=args.rules,
+                persist_labels=args.persist_labels,
+                cross_session=args.cross_session,
             )
             calls = store.get_calls(args.session)
             frags = store.get_fragments(args.session)
@@ -196,7 +218,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.subcommand == "report":
             if args.recompute or not store.get_calls(args.session):
-                analyze_session(store, args.session, min_score=args.min_score)
+                analyze_session(
+                    store,
+                    args.session,
+                    min_score=args.min_score,
+                    cross_session=args.cross_session,
+                )
+            elif args.cross_session:
+                match_cross_session_taint(store, args.session)
             graph = build_flow_graph(store, args.session, min_score=args.min_score)
             paths = find_hazardous_paths(
                 graph,

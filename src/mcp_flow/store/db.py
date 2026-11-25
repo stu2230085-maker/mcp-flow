@@ -105,8 +105,27 @@ CREATE INDEX IF NOT EXISTS idx_flows_dst ON flows(dst_frag);
 CREATE INDEX IF NOT EXISTS idx_labels_target ON labels(target_kind, target_id);
 """
 
+SCHEMA_V2_SQL = """
+CREATE TABLE IF NOT EXISTS persistent_fingerprints(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_session_id TEXT NOT NULL,
+    origin_call_id INTEGER NOT NULL,
+    origin_frag_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    norm_hash TEXT NOT NULL,
+    raw_hash TEXT NOT NULL,
+    length INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_persistent_fp_raw_hash ON persistent_fingerprints(raw_hash);
+CREATE INDEX IF NOT EXISTS idx_persistent_fp_norm_hash ON persistent_fingerprints(norm_hash);
+CREATE INDEX IF NOT EXISTS idx_persistent_fp_session ON persistent_fingerprints(origin_session_id);
+"""
+
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "Initial M0 schema for mcp-flow", SCHEMA_V1_SQL),
+    (2, "Add persistent_fingerprints table for cross-session taint tracking", SCHEMA_V2_SQL),
 ]
 
 
@@ -167,6 +186,19 @@ class LabelRow:
     target_id: int
     label: str
     source: str
+
+
+@dataclass
+class PersistentFingerprintRow:
+    id: int
+    origin_session_id: str
+    origin_call_id: int
+    origin_frag_id: int
+    label: str
+    norm_hash: str
+    raw_hash: str
+    length: int
+    created_at: float
 
 
 class FlowStore:
@@ -474,6 +506,7 @@ class FlowStore:
                     "DELETE FROM calls WHERE session_id = ?",
                     (session_id,),
                 )
+        self.clear_persistent_fingerprints(session_id)
 
     def clear_flows(self, session_id: str) -> None:
         """Clear only the flows table for a session without deleting calls or fragments."""
@@ -703,6 +736,175 @@ class FlowStore:
         rows = self.conn.execute("SELECT server, tool, role FROM tool_roles").fetchall()
         return {(r["server"], r["tool"]): r["role"] for r in rows}
 
+    def get_session_started_at(self, session_id: str) -> float | None:
+        """Return the recorded `started_at` timestamp for `session_id`, if present."""
+        row = self.conn.execute(
+            "SELECT started_at FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None or row["started_at"] is None:
+            return None
+        return float(row["started_at"])
+
+    def insert_persistent_fingerprint(
+        self,
+        origin_session_id: str,
+        origin_call_id: int,
+        origin_frag_id: int,
+        label: str,
+        norm_hash: str,
+        raw_hash: str,
+        length: int,
+        created_at: float | None = None,
+    ) -> int:
+        """Insert a hash-only sensitive output fingerprint for cross-session taint tracking."""
+        ts = created_at if created_at is not None else time.time()
+        with self.conn:
+            existing = self.conn.execute(
+                """
+                SELECT id FROM persistent_fingerprints
+                WHERE origin_session_id = ?
+                  AND origin_frag_id = ?
+                  AND label = ?
+                  AND raw_hash = ?
+                  AND norm_hash = ?
+                """,
+                (origin_session_id, origin_frag_id, label, raw_hash, norm_hash),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
+            cur = self.conn.execute(
+                """
+                INSERT INTO persistent_fingerprints(
+                    origin_session_id, origin_call_id, origin_frag_id,
+                    label, norm_hash, raw_hash, length, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    origin_session_id,
+                    origin_call_id,
+                    origin_frag_id,
+                    label,
+                    norm_hash,
+                    raw_hash,
+                    length,
+                    ts,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def clear_persistent_fingerprints(self, session_id: str) -> None:
+        """Delete persistent fingerprints originating from `session_id`."""
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM persistent_fingerprints WHERE origin_session_id = ?",
+                (session_id,),
+            )
+
+    def get_persistent_fingerprints(
+        self,
+        origin_session_id: str | None = None,
+        exclude_session_id: str | None = None,
+    ) -> list[PersistentFingerprintRow]:
+        """Return persistent fingerprint records, optionally filtered by origin session."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if origin_session_id is not None:
+            clauses.append("origin_session_id = ?")
+            params.append(origin_session_id)
+        if exclude_session_id is not None:
+            clauses.append("origin_session_id != ?")
+            params.append(exclude_session_id)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT id, origin_session_id, origin_call_id, origin_frag_id,
+                   label, norm_hash, raw_hash, length, created_at
+            FROM persistent_fingerprints
+            {where_sql}
+            ORDER BY id ASC
+            """,
+            params,
+        ).fetchall()
+        return [
+            PersistentFingerprintRow(
+                id=r["id"],
+                origin_session_id=r["origin_session_id"],
+                origin_call_id=r["origin_call_id"],
+                origin_frag_id=r["origin_frag_id"],
+                label=r["label"],
+                norm_hash=r["norm_hash"],
+                raw_hash=r["raw_hash"],
+                length=r["length"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def find_persistent_fingerprints_by_hashes(
+        self,
+        raw_hashes: set[str],
+        norm_hashes: set[str],
+        exclude_session_id: str | None = None,
+        max_origin_started_at: float | None = None,
+    ) -> list[PersistentFingerprintRow]:
+        """
+        Look up persistent fingerprints matching any hash in `raw_hashes` or `norm_hashes`
+        from earlier sessions (excluding `exclude_session_id`).
+        """
+        if not raw_hashes and not norm_hashes:
+            return []
+
+        results_by_id: dict[int, PersistentFingerprintRow] = {}
+        chunk_size = 400
+
+        def _query_column(column: str, hashes: list[str]) -> None:
+            for i in range(0, len(hashes), chunk_size):
+                batch = hashes[i : i + chunk_size]
+                placeholders = ",".join("?" for _ in batch)
+                clauses = [f"pf.{column} IN ({placeholders})"]
+                params: list[Any] = list(batch)
+                if exclude_session_id is not None:
+                    clauses.append("pf.origin_session_id != ?")
+                    params.append(exclude_session_id)
+                if max_origin_started_at is not None:
+                    clauses.append("(s.started_at IS NULL OR s.started_at <= ?)")
+                    params.append(max_origin_started_at)
+                where_sql = " AND ".join(clauses)
+                rows = self.conn.execute(
+                    f"""
+                    SELECT pf.id, pf.origin_session_id, pf.origin_call_id, pf.origin_frag_id,
+                           pf.label, pf.norm_hash, pf.raw_hash, pf.length, pf.created_at
+                    FROM persistent_fingerprints pf
+                    LEFT JOIN sessions s ON s.id = pf.origin_session_id
+                    WHERE {where_sql}
+                    ORDER BY pf.id ASC
+                    """,
+                    params,
+                ).fetchall()
+                for r in rows:
+                    fp_id = int(r["id"])
+                    if fp_id not in results_by_id:
+                        results_by_id[fp_id] = PersistentFingerprintRow(
+                            id=fp_id,
+                            origin_session_id=r["origin_session_id"],
+                            origin_call_id=r["origin_call_id"],
+                            origin_frag_id=r["origin_frag_id"],
+                            label=r["label"],
+                            norm_hash=r["norm_hash"],
+                            raw_hash=r["raw_hash"],
+                            length=r["length"],
+                            created_at=r["created_at"],
+                        )
+
+        if raw_hashes:
+            _query_column("raw_hash", sorted(raw_hashes))
+        if norm_hashes:
+            _query_column("norm_hash", sorted(norm_hashes))
+
+        return [results_by_id[k] for k in sorted(results_by_id.keys())]
+
     def export_messages_jsonl(self, session_id: str) -> str:
         """Export raw messages for a session as JSONL for interoperability with other trace tools."""
         messages = self.get_messages(session_id)
@@ -737,6 +939,7 @@ class FlowStore:
         ]
         for sid in old_sessions:
             self.clear_derived_data(sid)
+            self.clear_persistent_fingerprints(sid)
             with self.conn:
                 self.conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 self.conn.execute("DELETE FROM servers WHERE session_id = ?", (sid,))
