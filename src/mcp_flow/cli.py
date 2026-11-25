@@ -217,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
                     min_score=args.min_score,
                     cross_session=args.cross_session,
                 )
+            elif args.cross_session:
+                match_cross_session_taint(store, args.session)
             graph = build_flow_graph(store, args.session, min_score=args.min_score)
             paths = find_hazardous_paths(
                 graph,

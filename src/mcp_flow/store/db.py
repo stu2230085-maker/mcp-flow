@@ -506,6 +506,7 @@ class FlowStore:
                     "DELETE FROM calls WHERE session_id = ?",
                     (session_id,),
                 )
+        self.clear_persistent_fingerprints(session_id)
 
     def clear_flows(self, session_id: str) -> None:
         """Clear only the flows table for a session without deleting calls or fragments."""

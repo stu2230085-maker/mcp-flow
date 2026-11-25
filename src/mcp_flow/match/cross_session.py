@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from mcp_flow.derive.fragments import normalize_basic, sha256_hex
 from mcp_flow.labels.detectors import detect_secrets_in_text
-from mcp_flow.match.base import is_informative_text
+from mcp_flow.match.base import is_informative_text, shannon_entropy
 from mcp_flow.store.db import FlowStore, FragmentRow, PersistentFingerprintRow
 
 PERSISTENT_LABEL_PREFIXES: tuple[str, ...] = ("secret:", "confidential:")
@@ -70,6 +70,24 @@ def _is_fragment_informative(frag: FragmentRow, min_len: int = 6) -> bool:
     if frag.text or frag.norm:
         return is_informative_text(frag.text, frag.norm, min_len=min_len)
     # Hash-only mode: no plaintext available, rely on length and presence of hash
+    return frag.len >= min_len and bool(frag.hash)
+
+
+def _is_fragment_eligible_for_inherited_label(
+    frag: FragmentRow,
+    min_len: int = 16,
+    min_entropy: float = 2.5,
+) -> bool:
+    """
+    Stricter information threshold for labels inherited from the parent call (e.g. `confidential:*`),
+    preventing short generic JSON field values like `"completed"` or `"production"` from being persisted.
+    """
+    if frag.text or frag.norm:
+        check_str = frag.norm if frag.norm else frag.text.strip().casefold()
+        if len(check_str) < min_len:
+            return False
+        return shannon_entropy(check_str) >= min_entropy
+    # Hash-only mode: no plaintext/norm available, rely on length and presence of hash
     return frag.len >= min_len and bool(frag.hash)
 
 
@@ -147,10 +165,18 @@ def register_persistent_fingerprints(
         if not _is_fragment_informative(frag, min_len=min_len):
             continue
 
+        direct_labels = frag_labels.get(frag.id, [])
+        inherited_labels = call_labels.get(frag.call_id, [])
+        allow_inherited = _is_fragment_eligible_for_inherited_label(frag)
+
         combined_labels: list[str] = []
-        for lbl_str in frag_labels.get(frag.id, []) + call_labels.get(frag.call_id, []):
+        for lbl_str in direct_labels:
             if lbl_str not in combined_labels:
                 combined_labels.append(lbl_str)
+        if allow_inherited:
+            for lbl_str in inherited_labels:
+                if lbl_str not in combined_labels:
+                    combined_labels.append(lbl_str)
         if not combined_labels:
             continue
 

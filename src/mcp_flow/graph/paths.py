@@ -30,13 +30,23 @@ class HazardousPath:
         }
 
 
+def _label_matches_pattern(lbl: str, pattern: str) -> bool:
+    pat = pattern.casefold()
+    lbl_cf = lbl.casefold()
+    if fnmatch.fnmatchcase(lbl_cf, pat) or pat in lbl_cf:
+        return True
+    if lbl.startswith("cross_session:"):
+        parts = lbl.split(":", 2)
+        if len(parts) == 3:
+            orig_cf = parts[2].casefold()
+            if fnmatch.fnmatchcase(orig_cf, pat) or pat in orig_cf:
+                return True
+    return False
+
+
 def _matches_source_criteria(node: CallNode, source_label: str | None) -> bool:
     if source_label and source_label != "*":
-        return any(
-            fnmatch.fnmatchcase(lbl.casefold(), source_label.casefold())
-            or source_label.casefold() in lbl.casefold()
-            for lbl in node.labels
-        )
+        return any(_label_matches_pattern(lbl, source_label) for lbl in node.labels)
     return node.role == "source" or len(node.labels) > 0
 
 
@@ -60,9 +70,12 @@ def find_hazardous_paths(
 
     for start_node in source_nodes:
         cross_session_labels = [
-            lbl for lbl in start_node.labels if lbl.startswith("cross_session:")
+            lbl
+            for lbl in start_node.labels
+            if lbl.startswith("cross_session:")
+            and (not source_label or source_label == "*" or _label_matches_pattern(lbl, source_label))
         ]
-        if start_node.role == sink_role and cross_session_labels:
+        if start_node.role == sink_role and cross_session_labels and 1.0 >= min_score:
             results.append(
                 HazardousPath(
                     nodes=[start_node],

