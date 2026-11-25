@@ -4,21 +4,44 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 from mcp_flow.derive.calls import derive_calls
+from mcp_flow.config_wrapper import unwrap_mcp_config, wrap_mcp_config
 from mcp_flow.derive.fragments import derive_fragments
 from mcp_flow.graph.builder import build_flow_graph
 from mcp_flow.graph.exporters import format_cli_report, to_dot, to_json_dict, to_mermaid
 from mcp_flow.graph.paths import find_hazardous_paths
+from mcp_flow.interop.trace_io import export_otel_spans, import_trace_jsonl
 from mcp_flow.labels.rules import LabelRuleEngine
+from mcp_flow.match.cross_session import match_cross_session_taint
 from mcp_flow.match.engine import FingerprintEngine
 from mcp_flow.proxy.http_proxy import StreamableHttpProxyServer
 from mcp_flow.proxy.stdio_proxy import run_stdio_proxy
 from mcp_flow.server.mcp_server import run_stdio_mcp_server
 from mcp_flow.store.db import FlowStore
 from mcp_flow.store.redaction import RedactionPolicy
+
+
+def _atomic_write_bytes(target: Path, data: bytes, mode: int) -> None:
+    """Write *data* to a temp file in *target.parent* with *mode* and replace *target*."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        os.chmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def analyze_session(
@@ -28,6 +51,8 @@ def analyze_session(
     enable_semantic: bool = False,
     min_score: float = 0.35,
     rules_path: str | None = None,
+    persist_labels: bool = False,
+    cross_session: bool = False,
 ) -> None:
     """Recompute all derived data (`calls`, `fragments`, `flows`, `labels`) from immutable `messages`."""
     store.clear_derived_data(session_id)
@@ -44,7 +69,9 @@ def analyze_session(
         if rules_path
         else LabelRuleEngine()
     )
-    rule_engine.apply_to_session(store, session_id)
+    rule_engine.apply_to_session(store, session_id, persist_labels=persist_labels)
+    if cross_session:
+        match_cross_session_taint(store, session_id)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,6 +105,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--enable-semantic", action="store_true", help="Enable Stage 5 semantic similarity")
     p_analyze.add_argument("--min-score", type=float, default=0.35)
     p_analyze.add_argument("--rules", help="Optional JSON rules file for tool roles and labels")
+    p_analyze.add_argument(
+        "--persist-labels",
+        action="store_true",
+        help="Record hash-only fingerprints of sensitive output fragments for cross-session tracking",
+    )
+    p_analyze.add_argument(
+        "--cross-session",
+        action="store_true",
+        help="Match input fragments against persistent fingerprints from earlier sessions",
+    )
 
     # 3. report
     p_report = sub.add_parser("report", help="Detect and report hazardous paths from confidential sources to sinks")
@@ -88,6 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--format", choices=["text", "json"], default="text")
     p_report.add_argument("--expose-text", action="store_true", help="Include raw fragment text snippets in output")
     p_report.add_argument("--recompute", action="store_true", help="Force recomputation before reporting")
+    p_report.add_argument(
+        "--cross-session",
+        action="store_true",
+        help="Enable cross-session taint matching when recomputing",
+    )
 
     # 4. graph
     p_graph = sub.add_parser("graph", help="Export call-level data dependency graph as Mermaid, DOT, or JSON")
@@ -104,9 +146,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_label.add_argument("--label", required=True, help="Label string (e.g. confidential:manual)")
 
     # 6. export
-    p_export = sub.add_parser("export", help="Export raw messages of a session as JSONL")
+    p_export = sub.add_parser("export", help="Export session messages as JSONL or derived spans as OpenTelemetry JSON")
     p_export.add_argument("session", help="Session ID")
-    p_export.add_argument("--out", help="Output JSONL file path")
+    p_export.add_argument("--format", choices=["jsonl", "otel"], default="jsonl")
+    p_export.add_argument("--out", help="Output file path")
+
+    # 6b. import
+    p_import = sub.add_parser("import", help="Import JSONL or mcptape-compatible trace recordings into raw messages")
+    p_import.add_argument("jsonl_file", help="Path to JSONL trace file")
+    p_import.add_argument("--session", help="Override session ID for imported messages")
 
     # 7. serve-mcp
     p_serve = sub.add_parser("serve-mcp", help="Run read-only MCP inspection server over stdio")
@@ -119,6 +167,17 @@ def build_parser() -> argparse.ArgumentParser:
     # 8. evaluate
     p_eval = sub.add_parser("evaluate", help="Run synthetic scenarios and report stage-by-stage Precision/Recall/FPR")
     p_eval.add_argument("--format", choices=["text", "json"], default="text")
+
+    # 9. wrap-config
+    p_wrap = sub.add_parser(
+        "wrap-config", help="Wrap MCP client server commands with the recording proxy"
+    )
+    p_wrap.add_argument("config_json_path", help="MCP client JSON configuration file")
+    p_wrap.add_argument("--session", help="Session ID (generated when omitted)")
+    p_wrap.add_argument("--db", dest="config_db", default=None, help="Local SQLite database path")
+    p_wrap.add_argument("--servers", help="Comma-separated MCP server names to target")
+    p_wrap.add_argument("--unwrap", action="store_true", help="Restore original commands")
+    p_wrap.add_argument("--dry-run", action="store_true", help="Print transformed JSON without writing")
 
     return parser
 
@@ -136,6 +195,45 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_evaluation_report(metrics), end="")
         return 0
+
+    if args.subcommand == "wrap-config":
+        path = Path(args.config_json_path)
+        try:
+            original_bytes = path.read_bytes()
+            config = json.loads(original_bytes.decode("utf-8"))
+            if not isinstance(config, dict):
+                raise ValueError("Configuration root must be a JSON object")
+            selected = (
+                [name.strip() for name in args.servers.split(",") if name.strip()]
+                if args.servers is not None
+                else None
+            )
+            db_path = args.config_db if args.config_db is not None else args.db
+            if args.unwrap:
+                transformed = unwrap_mcp_config(config, servers=selected)
+            else:
+                transformed = wrap_mcp_config(
+                    config,
+                    session_id=args.session or uuid.uuid4().hex,
+                    db_path=db_path,
+                    servers=selected,
+                )
+            rendered = json.dumps(transformed, indent=2, ensure_ascii=False) + "\n"
+            if args.dry_run:
+                sys.stdout.write(rendered)
+                return 0
+            if transformed == config:
+                print("Configuration unchanged.")
+                return 0
+            backup = Path(str(path) + ".bak")
+            _atomic_write_bytes(backup, original_bytes, 0o600)
+            target_mode = stat.S_IMODE(path.stat().st_mode) or 0o600
+            _atomic_write_bytes(path, rendered.encode("utf-8"), target_mode)
+            print(f"Updated {path}; backup: {backup}")
+            return 0
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            print(f"mcp-flow wrap-config: {exc}", file=sys.stderr)
+            return 2
 
     redaction = RedactionPolicy.from_regex_strings(
         getattr(args, "redact_pattern", []),
@@ -177,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
                 enable_semantic=args.enable_semantic,
                 min_score=args.min_score,
                 rules_path=args.rules,
+                persist_labels=args.persist_labels,
+                cross_session=args.cross_session,
             )
             calls = store.get_calls(args.session)
             frags = store.get_fragments(args.session)
@@ -189,7 +289,14 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.subcommand == "report":
             if args.recompute or not store.get_calls(args.session):
-                analyze_session(store, args.session, min_score=args.min_score)
+                analyze_session(
+                    store,
+                    args.session,
+                    min_score=args.min_score,
+                    cross_session=args.cross_session,
+                )
+            elif args.cross_session:
+                match_cross_session_taint(store, args.session)
             graph = build_flow_graph(store, args.session, min_score=args.min_score)
             paths = find_hazardous_paths(
                 graph,
@@ -244,11 +351,39 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.subcommand == "export":
-            jsonl = store.export_messages_jsonl(args.session)
-            if args.out:
-                Path(args.out).write_text(jsonl, encoding="utf-8")
+            if args.format == "otel":
+                if not store.get_calls(args.session):
+                    analyze_session(store, args.session)
+                rendered = (
+                    json.dumps(
+                        export_otel_spans(store, args.session),
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             else:
-                sys.stdout.write(jsonl)
+                rendered = store.export_messages_jsonl(args.session)
+            if args.out:
+                Path(args.out).write_text(rendered, encoding="utf-8")
+            else:
+                sys.stdout.write(rendered)
+            return 0
+
+        if args.subcommand == "import":
+            try:
+                result = import_trace_jsonl(
+                    store,
+                    args.jsonl_file,
+                    session_id=args.session,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"mcp-flow import: {exc}", file=sys.stderr)
+                return 2
+            print(
+                f"Imported {result.imported_messages} messages into session '{result.session_id}' "
+                f"(servers: {', '.join(result.servers) or 'none'})."
+            )
             return 0
 
         if args.subcommand == "serve-mcp":

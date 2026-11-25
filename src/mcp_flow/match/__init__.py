@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from mcp_flow.match.base import CandidateEdge, MatchContext, MatchFragment, Matcher
+from mcp_flow.match.cross_session import (
+    CrossSessionMatch,
+    CrossSessionMatcher,
+    match_cross_session_taint,
+    register_persistent_fingerprints,
+)
 from mcp_flow.match.engine import FingerprintEngine
 from mcp_flow.match.exact import ExactMatcher
 from mcp_flow.match.minhash import MinHashMatcher
@@ -12,6 +18,8 @@ from mcp_flow.match.substring import SubstringMatcher
 
 __all__ = [
     "CandidateEdge",
+    "CrossSessionMatch",
+    "CrossSessionMatcher",
     "ExactMatcher",
     "FingerprintEngine",
     "MatchContext",
@@ -21,4 +29,6 @@ __all__ = [
     "NormalizedMatcher",
     "SemanticMatcher",
     "SubstringMatcher",
+    "match_cross_session_taint",
+    "register_persistent_fingerprints",
 ]

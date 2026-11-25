@@ -98,10 +98,18 @@ class LabelRuleEngine:
 
         return (role or "neutral"), matched_labels
 
-    def apply_to_session(self, store: FlowStore, session_id: str) -> dict[str, Any]:
+    def apply_to_session(
+        self,
+        store: FlowStore,
+        session_id: str,
+        persist_labels: bool = False,
+    ) -> dict[str, Any]:
         """
         Populate `tool_roles` and `labels` for all calls and fragments in `session_id`
         using configured pattern rules and regex content detectors.
+
+        When `persist_labels=True`, sensitive `out` fragments (`secret:*`, `confidential:*`)
+        are also registered in `persistent_fingerprints` (hash-only, no plaintext).
         """
         explicit_roles = store.get_tool_roles()
         calls: list[CallRow] = store.get_calls(session_id)
@@ -129,7 +137,15 @@ class LabelRuleEngine:
                     store.insert_label("call", frag.call_id, det.label, source=det.detector)
                 labels_added += 1
 
+        persisted_count = 0
+        if persist_labels:
+            from mcp_flow.match.cross_session import register_persistent_fingerprints
+
+            persisted = register_persistent_fingerprints(store, session_id)
+            persisted_count = len(persisted)
+
         return {
             "role_counts": role_counts,
             "labels_added": labels_added,
+            "persisted_fingerprints": persisted_count,
         }
