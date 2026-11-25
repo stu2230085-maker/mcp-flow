@@ -12,6 +12,7 @@ from mcp_flow.derive.fragments import derive_fragments
 from mcp_flow.graph.builder import build_flow_graph
 from mcp_flow.graph.exporters import format_cli_report, to_dot, to_json_dict, to_mermaid
 from mcp_flow.graph.paths import find_hazardous_paths
+from mcp_flow.interop.trace_io import export_otel_spans, import_trace_jsonl
 from mcp_flow.labels.rules import LabelRuleEngine
 from mcp_flow.match.engine import FingerprintEngine
 from mcp_flow.proxy.http_proxy import StreamableHttpProxyServer
@@ -104,9 +105,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_label.add_argument("--label", required=True, help="Label string (e.g. confidential:manual)")
 
     # 6. export
-    p_export = sub.add_parser("export", help="Export raw messages of a session as JSONL")
+    p_export = sub.add_parser("export", help="Export session messages as JSONL or derived spans as OpenTelemetry JSON")
     p_export.add_argument("session", help="Session ID")
-    p_export.add_argument("--out", help="Output JSONL file path")
+    p_export.add_argument("--format", choices=["jsonl", "otel"], default="jsonl")
+    p_export.add_argument("--out", help="Output file path")
+
+    # 6b. import
+    p_import = sub.add_parser("import", help="Import JSONL or mcptape-compatible trace recordings into raw messages")
+    p_import.add_argument("jsonl_file", help="Path to JSONL trace file")
+    p_import.add_argument("--session", help="Override session ID for imported messages")
 
     # 7. serve-mcp
     p_serve = sub.add_parser("serve-mcp", help="Run read-only MCP inspection server over stdio")
@@ -244,11 +251,39 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.subcommand == "export":
-            jsonl = store.export_messages_jsonl(args.session)
-            if args.out:
-                Path(args.out).write_text(jsonl, encoding="utf-8")
+            if args.format == "otel":
+                if not store.get_calls(args.session):
+                    analyze_session(store, args.session)
+                rendered = (
+                    json.dumps(
+                        export_otel_spans(store, args.session),
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
             else:
-                sys.stdout.write(jsonl)
+                rendered = store.export_messages_jsonl(args.session)
+            if args.out:
+                Path(args.out).write_text(rendered, encoding="utf-8")
+            else:
+                sys.stdout.write(rendered)
+            return 0
+
+        if args.subcommand == "import":
+            try:
+                result = import_trace_jsonl(
+                    store,
+                    args.jsonl_file,
+                    session_id=args.session,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"mcp-flow import: {exc}", file=sys.stderr)
+                return 2
+            print(
+                f"Imported {result.imported_messages} messages into session '{result.session_id}' "
+                f"(servers: {', '.join(result.servers) or 'none'})."
+            )
             return 0
 
         if args.subcommand == "serve-mcp":
