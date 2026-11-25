@@ -1,9 +1,18 @@
 # mcp-flow — MCP Data Flow Tracer
 
+[![CI](https://github.com/stu2230085-maker/mcp-flow/actions/workflows/ci.yml/badge.svg)](https://github.com/stu2230085-maker/mcp-flow/actions/workflows/ci.yml)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)
+![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20%28stdlib%20only%29-brightgreen)
+![Eval NegFP 0](https://img.shields.io/badge/eval-F1%201.00%20%7C%20NegFP%200-success)
+![Passive & Local 0600](https://img.shields.io/badge/privacy-local%200600%20%7C%20passive--only-0A7B83)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+
+[Quick Start](#quick-start) · [CLI Reference](#cli-reference-all-10-subcommands) · [Architecture](#architecture) · [Security Model](#security--privacy-model) · [Design Doc](docs/design.md)
+
 **`mcp-flow`** is a zero-dependency passive data-flow tracer and dependency graph analyzer for the **Model Context Protocol (MCP)**. It sits transparently between an MCP client (such as Claude Desktop, Cursor, or Claude Code) and multiple MCP servers, records raw JSON-RPC 2.0 messages into a local SQLite database (`0600` permissions, WAL mode), and automatically tracks which tool outputs flowed into subsequent tool inputs across servers.
 
-> **Important Epistemic Disclaimer**  
-> At the protocol boundary, `mcp-flow` observes **content correlation** between tool outputs and subsequent tool inputs—not the internal reasoning of the LLM. Every report, graph, and API response explicitly notes that an edge represents an **observed content match (potential dependency)**, not formal proof of causation.
+> [!IMPORTANT]
+> **Epistemic Disclaimer:** At the protocol boundary, `mcp-flow` observes **content correlation** between tool outputs and subsequent tool inputs—not the internal reasoning of the LLM. Every report, graph, and API response explicitly notes that an edge represents an **observed content match (potential dependency)**, not formal proof of causation.
 
 ---
 
@@ -50,6 +59,16 @@ When an AI agent connects to multiple MCP servers simultaneously, data returned 
 
 ## Key Features
 
+### At a Glance
+
+| Pillar | Capability | Highlights |
+| :--- | :--- | :--- |
+| **Passive Relay** | `stdio` & Streamable HTTP proxy | Zero-mutation JSON-RPC relay, `0600` SQLite WAL log, `--redact-pattern`, `--hash-only` |
+| **Recomputable Pipeline** | `messages -> calls -> fragments -> flows` | Append-only primary log; re-run matching & rules anytime via `mcp-flow analyze` |
+| **5-Stage Matching** | `exact` → `substring` → `normalized` → `minhash` → `semantic` | Base64/URL/JSON decoding, MinHash shingling, entropy & IDF false-positive suppression |
+| **Taint & Path Finding** | Role rules + built-in secret detectors | Detects API keys, JWTs, AWS/GitHub tokens, PEM keys, emails, and confidential markers |
+| **3 Output Channels** | CLI, Graph Exports, Read-Only MCP Server | Mermaid, DOT, JSON, JSONL, OTel spans, and `serve-mcp` (redacted by default) |
+
 1. **Zero-Mutation Passive Proxy (`stdio` & `Streamable HTTP`)**:
    - Relays JSON-RPC messages between MCP clients and servers without modifying a single byte or blocking I/O.
    - Appends raw frames to an immutable `messages` log in local SQLite (`0600` owner-only permissions).
@@ -59,10 +78,10 @@ When an AI agent connects to multiple MCP servers simultaneously, data returned 
    - Decomposes input arguments (`side='in'`) and output results (`side='out'`) down to leaf strings and embedded JSON fields (`fragments`).
    - Re-runs matching algorithms at any time via `mcp-flow analyze` without re-recording traffic.
 3. **5-Stage Cascading Fingerprint Engine**:
-   - **Stage 1 (`exact`)**: Raw & basic-normalized SHA-256 hash match ($O(1)$ lookup).
+   - **Stage 1 (`exact`)**: Raw & basic-normalized SHA-256 hash match (`O(1)` lookup).
    - **Stage 2 (`substring`)**: Contiguous common substring & payload embedding detection with character offset spans.
    - **Stage 3 (`normalized`)**: Multi-pass decoding across Base64 (full & embedded tokens), URL-encoding, JSON escaping, Unicode NFKC, and whitespace stripping.
-   - **Stage 4 (`minhash`)**: Character $k$-gram and word shingling with Universal MinHash signatures & Jaccard/containment similarity for edited or reordered text.
+   - **Stage 4 (`minhash`)**: Character `k`-gram and word shingling with Universal MinHash signatures & Jaccard/containment similarity for edited or reordered text.
    - **Stage 5 (`semantic`, opt-in)**: Pluggable embedding vector cosine similarity (with zero-dependency IDF-weighted hybrid lexical/CJK vector fallback) for heavy paraphrasing.
    - **False-Positive Suppression**: Shannon entropy filters, boolean/literal exclusion, session-wide IDF rarity weighting, and strict temporal ordering (`src_seq < dst_seq`).
 4. **Confidentiality Labels & Hazardous Path Detection**:
@@ -127,6 +146,12 @@ python3 -m mcp_flow wrap-config ~/.config/claude/claude_desktop_config.json --se
 python3 -m mcp_flow wrap-config ~/.config/claude/claude_desktop_config.json --session work-session-01 --db /path/to/mcp_flow.db
 ```
 
+> [!TIP]
+> Always preview config edits first with `--dry-run`, and restore your original `mcpServers` entries anytime using `--unwrap`. For multi-session workflows, pair `analyze --persist-labels` with `--cross-session` to track sensitive output fingerprints across separate sessions without storing raw text.
+
+<details>
+<summary>Alternative: Manual <code>mcpServers</code> JSON configuration (without <code>wrap-config</code>)</summary>
+
 Alternatively, replace your MCP server command manually with `python3 -m mcp_flow proxy` (or `mcp-flow proxy` if installed):
 
 ```json
@@ -159,6 +184,8 @@ Alternatively, replace your MCP server command manually with `python3 -m mcp_flo
   }
 }
 ```
+
+</details>
 
 ### 2. Inspect Hazardous Data Flows & Generate Graphs
 
@@ -477,6 +504,9 @@ Regardless of tool names, `mcp-flow` inspects fragment strings for sensitive con
 - **Local-Only & `0600` Permissions**: All trace data resides strictly in a local SQLite file enforced with `0600` (`rw-------`) owner-only file permissions. No telemetry or external network requests are ever made.
 - **Pre-Storage Redaction & Hash-Only Mode**: Sensitive patterns can be scrubbed before hitting disk (`--redact-pattern`), or raw text can be discarded during fragment derivation (`--hash-only`) while still permitting Stage 1 exact hash matching.
 - **Default Non-Disclosure in `serve-mcp`**: The read-only MCP server never returns raw fragment text unless `--expose-text` is explicitly passed, preventing sensitive payloads from being re-exposed to the LLM context window during self-inspection.
+
+> [!NOTE]
+> Keeping `expose_text=False` (the default in `serve-mcp`) ensures an AI agent auditing its own trace only sees structural metadata—SHA-256 hashes, byte lengths, JSONPaths, character offset spans, and confidence scores—eliminating the risk of secret re-injection into the LLM context window.
 
 ---
 
