@@ -7,6 +7,7 @@ import os
 import sqlite3
 import stat
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -314,6 +315,72 @@ class FlowStore:
                 (session_id, server_id, msg_ts, direction, kind, method, rpc_id, stored_body),
             )
             return int(cur.lastrowid or 0)
+
+    def append_messages_batch(
+        self,
+        messages: Sequence[dict[str, Any] | tuple[Any, ...]],
+    ) -> int:
+        """
+        Append multiple raw JSON-RPC messages in a single SQLite transaction.
+
+        Each item may be a dict with keys ``session_id``, ``server_id``, ``direction`` (or ``dir``),
+        ``kind``, ``method``, ``rpc_id``, ``body``, and optional ``ts``; or a 7/8-tuple
+        ``(session_id, server_id, direction, kind, method, rpc_id, body[, ts])``.
+
+        Returns the number of inserted message rows.
+        """
+        if not messages:
+            return 0
+
+        if (
+            self.max_size_bytes is not None
+            and not self._is_memory
+            and Path(self.db_path).exists()
+            and Path(self.db_path).stat().st_size >= self.max_size_bytes
+        ):
+            raise RuntimeError(f"Database file exceeded max_size_bytes ({self.max_size_bytes})")
+
+        now = time.time()
+        rows: list[tuple[str, str, float, str, str, str | None, str | None, str]] = []
+        for item in messages:
+            if isinstance(item, dict):
+                session_id = item["session_id"]
+                server_id = item["server_id"]
+                direction = item["direction"] if "direction" in item else item["dir"]
+                kind = item["kind"]
+                method = item.get("method")
+                rpc_id = item.get("rpc_id")
+                body = item["body"]
+                ts = item.get("ts")
+            elif isinstance(item, tuple):
+                if len(item) == 8:
+                    session_id, server_id, direction, kind, method, rpc_id, body, ts = item
+                elif len(item) == 7:
+                    session_id, server_id, direction, kind, method, rpc_id, body = item
+                    ts = None
+                else:
+                    raise ValueError(f"Expected 7- or 8-tuple for batch message, got length {len(item)}")
+            else:
+                raise TypeError(f"Unsupported batch message type: {type(item).__name__}")
+
+            if direction not in ("c2s", "s2c"):
+                raise ValueError(f"Invalid direction: {direction}")
+            if kind not in ("request", "response", "notification"):
+                raise ValueError(f"Invalid message kind: {kind}")
+
+            stored_body = self.redaction_policy.redact_text(body)
+            msg_ts = float(ts) if ts is not None else now
+            rows.append((session_id, server_id, msg_ts, direction, kind, method, rpc_id, stored_body))
+
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO messages(session_id, server_id, ts, dir, kind, method, rpc_id, body)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all recorded sessions with message and call counts."""
