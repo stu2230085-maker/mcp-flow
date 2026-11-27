@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import urllib.error
@@ -14,17 +15,86 @@ from mcp_flow.store.db import FlowStore
 
 
 def _extract_jsonrpc_lines_from_http_body(body_text: str, content_type: str) -> list[str]:
-    """Extract JSON-RPC payloads from either application/json or text/event-stream (SSE) bodies."""
+    """
+    Extract JSON-RPC payloads from either application/json (single-line, pretty-printed,
+    batch array, or NDJSON) or text/event-stream (SSE, including multi-line data events).
+    """
     if "text/event-stream" in content_type.lower():
-        lines: list[str] = []
-        for line in body_text.splitlines():
-            stripped = line.strip()
+        payloads: list[str] = []
+        event_data: list[str] = []
+
+        def _flush_event() -> None:
+            if not event_data:
+                return
+            joined = "\n".join(event_data).strip()
+            event_data.clear()
+            if not joined:
+                return
+            try:
+                json.loads(joined)
+                payloads.append(joined)
+            except json.JSONDecodeError:
+                # Fallback if multiple independent JSON lines were emitted without blank-line separators
+                for part in joined.splitlines():
+                    part_s = part.strip()
+                    if part_s:
+                        payloads.append(part_s)
+
+        for raw_line in body_text.splitlines():
+            if not raw_line.strip():
+                _flush_event()
+                continue
+            stripped = raw_line.lstrip()
             if stripped.startswith("data:"):
-                data_part = stripped[len("data:") :].strip()
-                if data_part:
-                    lines.append(data_part)
-        return lines
-    return [line for line in body_text.splitlines() if line.strip()]
+                data_part = stripped[len("data:") :]
+                if data_part.startswith(" "):
+                    data_part = data_part[1:]
+                event_data.append(data_part)
+        _flush_event()
+        return payloads
+
+    stripped_body = body_text.strip()
+    if not stripped_body:
+        return []
+    try:
+        json.loads(stripped_body)
+        return [stripped_body]
+    except json.JSONDecodeError:
+        return [line for line in body_text.splitlines() if line.strip()]
+
+
+def _record_http_messages(
+    store: FlowStore,
+    session_id: str,
+    server_id: str,
+    direction: str,
+    body_bytes: bytes,
+    content_type: str,
+    ts: float,
+) -> None:
+    """Best-effort passive recording of HTTP JSON-RPC payloads; never raises to disrupt relay."""
+    try:
+        body_text = body_bytes.decode("utf-8", errors="replace")
+        records: list[tuple[str, str, str, str, str | None, str | None, str, float]] = []
+        for payload in _extract_jsonrpc_lines_from_http_body(body_text, content_type):
+            for msg in parse_jsonrpc_line(payload):
+                records.append(
+                    (
+                        session_id,
+                        server_id,
+                        direction,
+                        msg.kind,
+                        msg.method,
+                        msg.rpc_id,
+                        msg.raw_body,
+                        ts,
+                    )
+                )
+        if records:
+            store.append_messages_batch(records)
+    except Exception:
+        # Passive observer must never crash or block the HTTP relay
+        pass
 
 
 class StreamableHttpProxyServer:
@@ -63,25 +133,32 @@ class StreamableHttpProxyServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
-                length = int(self.headers.get("Content-Length", "0"))
+                raw_length = self.headers.get("Content-Length", "0")
+                try:
+                    length = int(raw_length)
+                    if length < 0:
+                        raise ValueError("Negative Content-Length")
+                except ValueError:
+                    err_body = b"Invalid Content-Length header"
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+
                 req_bytes = self.rfile.read(length) if length > 0 else b""
                 t_req = time.time()
 
-                req_text = req_bytes.decode("utf-8", errors="replace")
-                for line in _extract_jsonrpc_lines_from_http_body(
-                    req_text, self.headers.get("Content-Type", "application/json")
-                ):
-                    for msg in parse_jsonrpc_line(line):
-                        proxy_ref.store.append_message(
-                            session_id=proxy_ref.session_id,
-                            server_id=proxy_ref.server_id,
-                            direction="c2s",
-                            kind=msg.kind,
-                            method=msg.method,
-                            rpc_id=msg.rpc_id,
-                            body=msg.raw_body,
-                            ts=t_req,
-                        )
+                _record_http_messages(
+                    store=proxy_ref.store,
+                    session_id=proxy_ref.session_id,
+                    server_id=proxy_ref.server_id,
+                    direction="c2s",
+                    body_bytes=req_bytes,
+                    content_type=self.headers.get("Content-Type", "application/json"),
+                    ts=t_req,
+                )
 
                 forward_headers = {
                     k: v
@@ -103,22 +180,26 @@ class StreamableHttpProxyServer:
                     status = exc.code
                     resp_headers = exc.headers
                     resp_bytes = exc.read()
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    err_body = f"Upstream unreachable: {exc}".encode("utf-8", errors="replace")
+                    self.send_response(502)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
 
                 t_res = time.time()
                 resp_ct = resp_headers.get("Content-Type", "application/json") if resp_headers else "application/json"
-                resp_text = resp_bytes.decode("utf-8", errors="replace")
-                for line in _extract_jsonrpc_lines_from_http_body(resp_text, resp_ct):
-                    for msg in parse_jsonrpc_line(line):
-                        proxy_ref.store.append_message(
-                            session_id=proxy_ref.session_id,
-                            server_id=proxy_ref.server_id,
-                            direction="s2c",
-                            kind=msg.kind,
-                            method=msg.method,
-                            rpc_id=msg.rpc_id,
-                            body=msg.raw_body,
-                            ts=t_res,
-                        )
+                _record_http_messages(
+                    store=proxy_ref.store,
+                    session_id=proxy_ref.session_id,
+                    server_id=proxy_ref.server_id,
+                    direction="s2c",
+                    body_bytes=resp_bytes,
+                    content_type=resp_ct,
+                    ts=t_res,
+                )
 
                 self.send_response(status)
                 if resp_headers:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 import unicodedata
 import urllib.parse
@@ -18,6 +19,20 @@ from mcp_flow.match.base import (
 
 _ALNUM_COMPACT_RE = re.compile(r"\s+")
 _BASE64_TOKEN_RE = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9_-]{16,}={0,2}")
+_JSON_ESCAPE_RE = re.compile(r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}(?:\\u[0-9a-fA-F]{4})?)')
+
+
+def _safe_json_unescape(text: str) -> str:
+    """Decode JSON escape sequences without corrupting existing non-ASCII Unicode characters."""
+
+    def _replace(match: re.Match[str]) -> str:
+        seq = match.group(0)
+        try:
+            return str(json.loads(f'"{seq}"'))
+        except json.JSONDecodeError:
+            return seq
+
+    return _JSON_ESCAPE_RE.sub(_replace, text)
 
 
 def _try_b64_decode(candidate: str) -> str | None:
@@ -67,13 +82,11 @@ def decode_and_normalize_variants(text: str) -> list[tuple[str, str]]:
         if unquoted2 != unquoted:
             _add("url2", unquoted2)
 
-    # 2. JSON string unescape
-    if "\\n" in text or '\\"' in text or "\\u" in text:
-        try:
-            unescaped = bytes(text, "utf-8").decode("unicode_escape")
+    # 2. JSON string unescape (UTF-8 safe)
+    if "\\" in text:
+        unescaped = _safe_json_unescape(text)
+        if unescaped != text:
             _add("json_unescape", unescaped)
-        except Exception:
-            pass
 
     # 3. Full or embedded Base64 decode on raw and URL-decoded strings
     for source_str in (text.strip(), unquoted.strip()):

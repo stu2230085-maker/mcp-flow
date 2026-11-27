@@ -165,6 +165,7 @@ class ReadOnlyFlowMcpServer:
                 return {
                     "error": f"Edge '{edge_id}' not found in session '{session_id}'",
                     "session_id": session_id,
+                    "disclaimer": OBSERVATION_DISCLAIMER,
                 }
             src_node = graph.nodes[edge.src_call_id]
             dst_node = graph.nodes[edge.dst_call_id]
@@ -195,7 +196,8 @@ class ReadOnlyFlowMcpServer:
         """Process a single JSON-RPC 2.0 request or notification and return response dict (or None for notifications)."""
         method = request.get("method")
         rpc_id = request.get("id")
-        params = request.get("params") or {}
+        raw_params = request.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
 
         # Notifications have no id
         if rpc_id is None:
@@ -223,8 +225,29 @@ class ReadOnlyFlowMcpServer:
             }
 
         if method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args = params.get("arguments") or {}
+            tool_name = str(params.get("name", ""))
+            raw_tool_args = params.get("arguments")
+            if raw_tool_args is not None and not isinstance(raw_tool_args, dict):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {
+                                        "error": "Tool arguments must be a JSON object",
+                                        "disclaimer": OBSERVATION_DISCLAIMER,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
+            tool_args = raw_tool_args or {}
             try:
                 payload = self.call_tool(tool_name, tool_args)
                 return {
@@ -245,7 +268,18 @@ class ReadOnlyFlowMcpServer:
                     "jsonrpc": "2.0",
                     "id": rpc_id,
                     "result": {
-                        "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {
+                                        "error": str(exc),
+                                        "disclaimer": OBSERVATION_DISCLAIMER,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        ],
                         "isError": True,
                     },
                 }
