@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import json
 from typing import Any
 
@@ -29,11 +30,10 @@ def _is_error_response(payload: dict[str, Any]) -> int:
 def derive_calls(store: FlowStore, session_id: str) -> list[CallRow]:
     """
     Scan all raw messages in `session_id`, pair `tools/call` requests with their responses
-    by `(server_id, rpc_id)`, and populate the `calls` table.
+    by `(server_id, rpc_id)` in FIFO order, and populate the `calls` table.
     """
     messages: list[MessageRow] = store.get_messages(session_id)
-    pending_requests: dict[tuple[str, str], tuple[MessageRow, str]] = {}
-    ordered_pending: list[tuple[str, str]] = []
+    pending_requests: dict[tuple[str, str], deque[tuple[MessageRow, str]]] = {}
     paired: dict[int, tuple[MessageRow, str, MessageRow | None]] = {}
 
     for msg in messages:
@@ -48,13 +48,15 @@ def derive_calls(store: FlowStore, session_id: str) -> list[CallRow]:
             tool_name = _extract_tool_name(payload)
             rpc_id = msg.rpc_id or f"seq:{msg.seq}"
             key = (msg.server_id, rpc_id)
-            pending_requests[key] = (msg, tool_name)
-            ordered_pending.append(key)
+            pending_requests.setdefault(key, deque()).append((msg, tool_name))
             paired[msg.seq] = (msg, tool_name, None)
         elif msg.dir == "s2c" and msg.kind == "response" and msg.rpc_id is not None:
             key = (msg.server_id, msg.rpc_id)
-            if key in pending_requests:
-                req_msg, tool_name = pending_requests.pop(key)
+            queue = pending_requests.get(key)
+            if queue:
+                req_msg, tool_name = queue.popleft()
+                if not queue:
+                    pending_requests.pop(key, None)
                 paired[req_msg.seq] = (req_msg, tool_name, msg)
 
     for req_seq in sorted(paired.keys()):

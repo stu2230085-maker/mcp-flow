@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -214,6 +215,7 @@ class FlowStore:
         self.redaction_policy = redaction_policy or RedactionPolicy()
         self.max_size_bytes = max_size_bytes
         self._is_memory = self.db_path == ":memory:"
+        self._lock = threading.RLock()
 
         if not self._is_memory:
             path_obj = Path(self.db_path)
@@ -226,21 +228,33 @@ class FlowStore:
         self.conn.row_factory = sqlite3.Row
         self._configure_pragmas()
         self.apply_migrations()
+        self._enforce_permissions()
 
-        if not self._is_memory and Path(self.db_path).exists():
-            os.chmod(self.db_path, stat.S_IRUSR | stat.S_IWUSR)
+    def _enforce_permissions(self) -> None:
+        """Enforce 0600 permissions on the SQLite database file and any WAL/SHM sidecars."""
+        if self._is_memory:
+            return
+        mode = stat.S_IRUSR | stat.S_IWUSR
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.db_path}{suffix}")
+            if candidate.exists():
+                try:
+                    os.chmod(candidate, mode)
+                except OSError:
+                    pass
 
     def _configure_pragmas(self) -> None:
         cur = self.conn.cursor()
         if not self._is_memory:
             cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA busy_timeout=5000;")
         cur.execute("PRAGMA synchronous=NORMAL;")
         cur.execute("PRAGMA foreign_keys=ON;")
         cur.close()
 
     def apply_migrations(self) -> None:
         """Apply any unapplied database migrations in order."""
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -264,7 +278,8 @@ class FlowStore:
 
     def close(self) -> None:
         """Close the SQLite connection."""
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def ensure_session(
         self,
@@ -275,7 +290,7 @@ class FlowStore:
     ) -> str:
         """Create or update a session entry."""
         ts = started_at if started_at is not None else time.time()
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 """
                 INSERT INTO sessions(id, started_at, client, note)
@@ -297,7 +312,7 @@ class FlowStore:
         transport: str = "stdio",
     ) -> str:
         """Register an MCP server instance within a session."""
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 """
                 INSERT INTO servers(id, session_id, name, command, transport)
@@ -338,7 +353,7 @@ class FlowStore:
 
         stored_body = self.redaction_policy.redact_text(body)
         msg_ts = ts if ts is not None else time.time()
-        with self.conn:
+        with self._lock, self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO messages(session_id, server_id, ts, dir, kind, method, rpc_id, body)
@@ -404,7 +419,7 @@ class FlowStore:
             msg_ts = float(ts) if ts is not None else now
             rows.append((session_id, server_id, msg_ts, direction, kind, method, rpc_id, stored_body))
 
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.executemany(
                 """
                 INSERT INTO messages(session_id, server_id, ts, dir, kind, method, rpc_id, body)
@@ -416,32 +431,34 @@ class FlowStore:
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """List all recorded sessions with message and call counts."""
-        rows = self.conn.execute(
-            """
-            SELECT
-                s.id,
-                s.started_at,
-                s.client,
-                s.note,
-                (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
-                (SELECT COUNT(*) FROM calls c WHERE c.session_id = s.id) AS call_count
-            FROM sessions s
-            ORDER BY s.started_at DESC, s.id ASC
-            """
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT
+                    s.id,
+                    s.started_at,
+                    s.client,
+                    s.note,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+                    (SELECT COUNT(*) FROM calls c WHERE c.session_id = s.id) AS call_count
+                FROM sessions s
+                ORDER BY s.started_at DESC, s.id ASC
+                """
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def get_messages(self, session_id: str) -> list[MessageRow]:
         """Return all messages for a session ordered by sequence number."""
-        rows = self.conn.execute(
-            """
-            SELECT seq, session_id, server_id, ts, dir, kind, method, rpc_id, body
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY seq ASC
-            """,
-            (session_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT seq, session_id, server_id, ts, dir, kind, method, rpc_id, body
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY seq ASC
+                """,
+                (session_id,),
+            ).fetchall()
         return [
             MessageRow(
                 seq=r["seq"],
@@ -459,76 +476,79 @@ class FlowStore:
 
     def get_server_map(self, session_id: str) -> dict[str, str]:
         """Return a mapping of server_id -> server_name for a session."""
-        rows = self.conn.execute(
-            "SELECT id, name FROM servers WHERE session_id = ?",
-            (session_id,),
-        ).fetchall()
-        mapping = {r["id"]: r["name"] for r in rows}
-        return mapping
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, name FROM servers WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        return {r["id"]: r["name"] for r in rows}
 
     def clear_derived_data(self, session_id: str) -> None:
         """Delete derived calls, fragments, flows, and auto-generated labels for a session so they can be recomputed."""
-        with self.conn:
-            call_ids = [
-                r["id"]
-                for r in self.conn.execute(
-                    "SELECT id FROM calls WHERE session_id = ?", (session_id,)
-                ).fetchall()
-            ]
-            if call_ids:
-                placeholders = ",".join("?" for _ in call_ids)
-                frag_ids = [
-                    r["id"]
-                    for r in self.conn.execute(
-                        f"SELECT id FROM fragments WHERE call_id IN ({placeholders})",
-                        call_ids,
-                    ).fetchall()
-                ]
-                if frag_ids:
-                    f_ph = ",".join("?" for _ in frag_ids)
-                    self.conn.execute(
-                        f"DELETE FROM flows WHERE src_frag IN ({f_ph}) OR dst_frag IN ({f_ph})",
-                        frag_ids + frag_ids,
-                    )
-                    self.conn.execute(
-                        f"DELETE FROM labels WHERE target_kind = 'fragment' AND target_id IN ({f_ph}) AND source != 'manual'",
-                        frag_ids,
-                    )
-                self.conn.execute(
-                    f"DELETE FROM labels WHERE target_kind = 'call' AND target_id IN ({placeholders}) AND source != 'manual'",
-                    call_ids,
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                DELETE FROM flows
+                WHERE src_frag IN (
+                    SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
                 )
-                self.conn.execute(
-                    f"DELETE FROM fragments WHERE call_id IN ({placeholders})",
-                    call_ids,
+                   OR dst_frag IN (
+                    SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
                 )
-                self.conn.execute(
-                    "DELETE FROM calls WHERE session_id = ?",
-                    (session_id,),
-                )
-        self.clear_persistent_fingerprints(session_id)
+                """,
+                (session_id, session_id),
+            )
+            self.conn.execute(
+                """
+                DELETE FROM labels
+                WHERE target_kind = 'fragment'
+                  AND source != 'manual'
+                  AND target_id IN (
+                      SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
+                  )
+                """,
+                (session_id,),
+            )
+            self.conn.execute(
+                """
+                DELETE FROM labels
+                WHERE target_kind = 'call'
+                  AND source != 'manual'
+                  AND target_id IN (SELECT id FROM calls WHERE session_id = ?)
+                """,
+                (session_id,),
+            )
+            self.conn.execute(
+                """
+                DELETE FROM fragments
+                WHERE call_id IN (SELECT id FROM calls WHERE session_id = ?)
+                """,
+                (session_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM calls WHERE session_id = ?",
+                (session_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM persistent_fingerprints WHERE origin_session_id = ?",
+                (session_id,),
+            )
 
     def clear_flows(self, session_id: str) -> None:
         """Clear only the flows table for a session without deleting calls or fragments."""
-        with self.conn:
-            frag_ids = [
-                r["id"]
-                for r in self.conn.execute(
-                    """
-                    SELECT f.id
-                    FROM fragments f
-                    JOIN calls c ON c.id = f.call_id
-                    WHERE c.session_id = ?
-                    """,
-                    (session_id,),
-                ).fetchall()
-            ]
-            if frag_ids:
-                f_ph = ",".join("?" for _ in frag_ids)
-                self.conn.execute(
-                    f"DELETE FROM flows WHERE src_frag IN ({f_ph}) OR dst_frag IN ({f_ph})",
-                    frag_ids + frag_ids,
+        with self._lock, self.conn:
+            self.conn.execute(
+                """
+                DELETE FROM flows
+                WHERE src_frag IN (
+                    SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
                 )
+                   OR dst_frag IN (
+                    SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
+                )
+                """,
+                (session_id, session_id),
+            )
 
     def insert_call(
         self,
@@ -541,7 +561,7 @@ class FlowStore:
         t_end: float | None,
         is_error: int,
     ) -> int:
-        with self.conn:
+        with self._lock, self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO calls(session_id, server_id, tool, req_seq, res_seq, t_start, t_end, is_error)
@@ -552,16 +572,17 @@ class FlowStore:
             return int(cur.lastrowid or 0)
 
     def get_calls(self, session_id: str) -> list[CallRow]:
-        server_map = self.get_server_map(session_id)
-        rows = self.conn.execute(
-            """
-            SELECT id, session_id, server_id, tool, req_seq, res_seq, t_start, t_end, is_error
-            FROM calls
-            WHERE session_id = ?
-            ORDER BY req_seq ASC, id ASC
-            """,
-            (session_id,),
-        ).fetchall()
+        with self._lock:
+            server_map = self.get_server_map(session_id)
+            rows = self.conn.execute(
+                """
+                SELECT id, session_id, server_id, tool, req_seq, res_seq, t_start, t_end, is_error
+                FROM calls
+                WHERE session_id = ?
+                ORDER BY req_seq ASC, id ASC
+                """,
+                (session_id,),
+            ).fetchall()
         return [
             CallRow(
                 id=r["id"],
@@ -590,7 +611,7 @@ class FlowStore:
     ) -> int:
         stored_text = "" if self.redaction_policy.hash_only else text
         stored_norm = "" if self.redaction_policy.hash_only else norm
-        with self.conn:
+        with self._lock, self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO fragments(call_id, side, json_path, text, norm, len, hash)
@@ -601,16 +622,17 @@ class FlowStore:
             return int(cur.lastrowid or 0)
 
     def get_fragments(self, session_id: str) -> list[FragmentRow]:
-        rows = self.conn.execute(
-            """
-            SELECT f.id, f.call_id, f.side, f.json_path, f.text, f.norm, f.len, f.hash
-            FROM fragments f
-            JOIN calls c ON c.id = f.call_id
-            WHERE c.session_id = ?
-            ORDER BY c.req_seq ASC, f.id ASC
-            """,
-            (session_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT f.id, f.call_id, f.side, f.json_path, f.text, f.norm, f.len, f.hash
+                FROM fragments f
+                JOIN calls c ON c.id = f.call_id
+                WHERE c.session_id = ?
+                ORDER BY c.req_seq ASC, f.id ASC
+                """,
+                (session_id,),
+            ).fetchall()
         return [
             FragmentRow(
                 id=r["id"],
@@ -634,7 +656,7 @@ class FlowStore:
         src_span: str,
         dst_span: str,
     ) -> int:
-        with self.conn:
+        with self._lock, self.conn:
             cur = self.conn.execute(
                 """
                 INSERT INTO flows(src_frag, dst_frag, kind, score, src_span, dst_span)
@@ -645,17 +667,18 @@ class FlowStore:
             return int(cur.lastrowid or 0)
 
     def get_flows(self, session_id: str) -> list[FlowRow]:
-        rows = self.conn.execute(
-            """
-            SELECT fl.id, fl.src_frag, fl.dst_frag, fl.kind, fl.score, fl.src_span, fl.dst_span
-            FROM flows fl
-            JOIN fragments fs ON fs.id = fl.src_frag
-            JOIN calls cs ON cs.id = fs.call_id
-            WHERE cs.session_id = ?
-            ORDER BY fl.score DESC, fl.id ASC
-            """,
-            (session_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT fl.id, fl.src_frag, fl.dst_frag, fl.kind, fl.score, fl.src_span, fl.dst_span
+                FROM flows fl
+                JOIN fragments fs ON fs.id = fl.src_frag
+                JOIN calls cs ON cs.id = fs.call_id
+                WHERE cs.session_id = ?
+                ORDER BY fl.score DESC, fl.id ASC
+                """,
+                (session_id,),
+            ).fetchall()
         return [
             FlowRow(
                 id=r["id"],
@@ -676,7 +699,7 @@ class FlowStore:
         label: str,
         source: str,
     ) -> int:
-        with self.conn:
+        with self._lock, self.conn:
             existing = self.conn.execute(
                 """
                 SELECT id FROM labels
@@ -696,18 +719,19 @@ class FlowStore:
             return int(cur.lastrowid or 0)
 
     def get_labels(self, session_id: str) -> list[LabelRow]:
-        rows = self.conn.execute(
-            """
-            SELECT l.id, l.target_kind, l.target_id, l.label, l.source
-            FROM labels l
-            WHERE (l.target_kind = 'call' AND l.target_id IN (SELECT id FROM calls WHERE session_id = ?))
-               OR (l.target_kind = 'fragment' AND l.target_id IN (
-                    SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
-               ))
-            ORDER BY l.id ASC
-            """,
-            (session_id, session_id),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT l.id, l.target_kind, l.target_id, l.label, l.source
+                FROM labels l
+                WHERE (l.target_kind = 'call' AND l.target_id IN (SELECT id FROM calls WHERE session_id = ?))
+                   OR (l.target_kind = 'fragment' AND l.target_id IN (
+                        SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
+                   ))
+                ORDER BY l.id ASC
+                """,
+                (session_id, session_id),
+            ).fetchall()
         return [
             LabelRow(
                 id=r["id"],
@@ -722,7 +746,7 @@ class FlowStore:
     def set_tool_role(self, server: str, tool: str, role: str) -> None:
         if role not in ("source", "sink", "neutral"):
             raise ValueError(f"Invalid role: {role}")
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 """
                 INSERT INTO tool_roles(server, tool, role)
@@ -733,15 +757,17 @@ class FlowStore:
             )
 
     def get_tool_roles(self) -> dict[tuple[str, str], str]:
-        rows = self.conn.execute("SELECT server, tool, role FROM tool_roles").fetchall()
+        with self._lock:
+            rows = self.conn.execute("SELECT server, tool, role FROM tool_roles").fetchall()
         return {(r["server"], r["tool"]): r["role"] for r in rows}
 
     def get_session_started_at(self, session_id: str) -> float | None:
         """Return the recorded `started_at` timestamp for `session_id`, if present."""
-        row = self.conn.execute(
-            "SELECT started_at FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT started_at FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
         if row is None or row["started_at"] is None:
             return None
         return float(row["started_at"])
@@ -759,7 +785,7 @@ class FlowStore:
     ) -> int:
         """Insert a hash-only sensitive output fingerprint for cross-session taint tracking."""
         ts = created_at if created_at is not None else time.time()
-        with self.conn:
+        with self._lock, self.conn:
             existing = self.conn.execute(
                 """
                 SELECT id FROM persistent_fingerprints
@@ -796,7 +822,7 @@ class FlowStore:
 
     def clear_persistent_fingerprints(self, session_id: str) -> None:
         """Delete persistent fingerprints originating from `session_id`."""
-        with self.conn:
+        with self._lock, self.conn:
             self.conn.execute(
                 "DELETE FROM persistent_fingerprints WHERE origin_session_id = ?",
                 (session_id,),
@@ -817,16 +843,17 @@ class FlowStore:
             clauses.append("origin_session_id != ?")
             params.append(exclude_session_id)
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self.conn.execute(
-            f"""
-            SELECT id, origin_session_id, origin_call_id, origin_frag_id,
-                   label, norm_hash, raw_hash, length, created_at
-            FROM persistent_fingerprints
-            {where_sql}
-            ORDER BY id ASC
-            """,
-            params,
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT id, origin_session_id, origin_call_id, origin_frag_id,
+                       label, norm_hash, raw_hash, length, created_at
+                FROM persistent_fingerprints
+                {where_sql}
+                ORDER BY id ASC
+                """,
+                params,
+            ).fetchall()
         return [
             PersistentFingerprintRow(
                 id=r["id"],
@@ -898,10 +925,11 @@ class FlowStore:
                             created_at=r["created_at"],
                         )
 
-        if raw_hashes:
-            _query_column("raw_hash", sorted(raw_hashes))
-        if norm_hashes:
-            _query_column("norm_hash", sorted(norm_hashes))
+        with self._lock:
+            if raw_hashes:
+                _query_column("raw_hash", sorted(raw_hashes))
+            if norm_hashes:
+                _query_column("norm_hash", sorted(norm_hashes))
 
         return [results_by_id[k] for k in sorted(results_by_id.keys())]
 
@@ -929,19 +957,37 @@ class FlowStore:
         return "\n".join(lines) + ("\n" if lines else "")
 
     def purge_older_than(self, max_age_seconds: float) -> int:
-        """Purge sessions and their messages/calls older than max_age_seconds."""
+        """Purge sessions and their messages/calls/labels older than max_age_seconds."""
         cutoff = time.time() - max_age_seconds
-        old_sessions = [
-            r["id"]
-            for r in self.conn.execute(
-                "SELECT id FROM sessions WHERE started_at < ?", (cutoff,)
-            ).fetchall()
-        ]
-        for sid in old_sessions:
-            self.clear_derived_data(sid)
-            self.clear_persistent_fingerprints(sid)
-            with self.conn:
-                self.conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-                self.conn.execute("DELETE FROM servers WHERE session_id = ?", (sid,))
-                self.conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-        return len(old_sessions)
+        with self._lock:
+            old_sessions = [
+                r["id"]
+                for r in self.conn.execute(
+                    "SELECT id FROM sessions WHERE started_at < ?", (cutoff,)
+                ).fetchall()
+            ]
+            for sid in old_sessions:
+                with self.conn:
+                    self.conn.execute(
+                        """
+                        DELETE FROM labels
+                        WHERE target_kind = 'fragment'
+                          AND target_id IN (
+                              SELECT f.id FROM fragments f JOIN calls c ON c.id = f.call_id WHERE c.session_id = ?
+                          )
+                        """,
+                        (sid,),
+                    )
+                    self.conn.execute(
+                        """
+                        DELETE FROM labels
+                        WHERE target_kind = 'call'
+                          AND target_id IN (SELECT id FROM calls WHERE session_id = ?)
+                        """,
+                        (sid,),
+                    )
+                    self.clear_derived_data(sid)
+                    self.conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                    self.conn.execute("DELETE FROM servers WHERE session_id = ?", (sid,))
+                    self.conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            return len(old_sessions)
