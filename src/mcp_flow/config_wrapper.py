@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -16,7 +17,11 @@ def _is_wrapped(entry: dict[str, Any]) -> bool:
     except ValueError:
         return False
     wrapper_args = args[:marker]
-    return "proxy" in wrapper_args and any(
+    if "proxy" not in wrapper_args:
+        return False
+    if Path(command).name in ("mcp-flow", "mcp-flow.exe"):
+        return True
+    return any(
         wrapper_args[i : i + 2] == ["-m", "mcp_flow"]
         for i in range(len(wrapper_args) - 1)
     )
@@ -49,6 +54,8 @@ def wrap_mcp_config(
     """Return a copy of *config* with selected MCP servers wrapped.
 
     Entries already invoking ``mcp_flow proxy`` are left unchanged.
+    Remote URL-only entries (with ``url`` and no ``command``) are skipped when
+    wrapping all servers (``servers=None``).
     """
     result = deepcopy(config)
     mcp_servers = result.get("mcpServers")
@@ -67,6 +74,12 @@ def wrap_mcp_config(
         if _is_wrapped(entry):
             continue
         command = entry.get("command")
+        if command is None and isinstance(entry.get("url"), str) and entry["url"].strip():
+            if selected is None:
+                continue
+            raise ValueError(
+                f'Server "{name}" uses a remote URL transport and cannot be wrapped as a stdio command'
+            )
         args = entry.get("args", [])
         if not isinstance(command, str) or not command:
             raise ValueError(f'Server "{name}" must have a non-empty command')

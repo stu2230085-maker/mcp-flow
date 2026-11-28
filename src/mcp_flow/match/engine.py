@@ -97,6 +97,8 @@ class FingerprintEngine:
                     continue
                 if existing is None or edge.score > existing.score:
                     best_edges[pair] = edge
+                    if edge.score >= self.short_circuit_score:
+                        ctx.skip_pairs.add(pair)
 
         return sorted(best_edges.values(), key=lambda e: (-e.score, e.src_frag, e.dst_frag))
 

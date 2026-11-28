@@ -154,6 +154,15 @@ def build_flow_graph(
             if lbl.label not in bucket:
                 bucket.append(lbl.label)
 
+    # Propagate labels attached directly to `out` fragments (e.g. manual fragment labels)
+    # onto their owning call node so path finding and graph exports reflect them.
+    for frag in fragments.values():
+        if frag.side == "out":
+            for lbl_str in frag_labels.get(frag.id, []):
+                bucket = call_labels.setdefault(frag.call_id, [])
+                if lbl_str not in bucket:
+                    bucket.append(lbl_str)
+
     nodes: dict[int, CallNode] = {}
     for c in calls:
         role = (

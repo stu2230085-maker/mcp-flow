@@ -95,52 +95,75 @@ class MinHashMatcher(Matcher):
         context = ctx or MatchContext.from_fragments(src_fragments + dst_fragments)
         edges: list[CandidateEdge] = []
 
-        src_data: dict[int, tuple[set[str], tuple[int, ...]]] = {}
-        for src in src_fragments:
-            if src.text and is_informative_text(src.text, src.norm, min_len=self.min_len, min_entropy=2.4):
-                sh = extract_shingles(src.norm or src.text, k=self.shingle_k)
-                if len(sh) >= 5:
-                    src_data[src.id] = (sh, compute_minhash_signature(sh, self.num_perm))
+        valid_srcs = [
+            s
+            for s in src_fragments
+            if s.text and is_informative_text(s.text, s.norm, min_len=self.min_len, min_entropy=2.4)
+        ]
+        valid_dsts = [
+            d
+            for d in dst_fragments
+            if d.text and is_informative_text(d.text, d.norm, min_len=self.min_len, min_entropy=2.4)
+        ]
 
-        dst_data: dict[int, tuple[set[str], tuple[int, ...]]] = {}
-        for dst in dst_fragments:
-            if dst.text and is_informative_text(dst.text, dst.norm, min_len=self.min_len, min_entropy=2.4):
-                sh = extract_shingles(dst.norm or dst.text, k=self.shingle_k)
-                if len(sh) >= 5:
-                    dst_data[dst.id] = (sh, compute_minhash_signature(sh, self.num_perm))
-
-        for src in src_fragments:
-            s_entry = src_data.get(src.id)
-            if not s_entry:
-                continue
-            s_shingles, s_sig = s_entry
-            for dst in dst_fragments:
+        candidate_pairs: list[tuple[MatchFragment, MatchFragment]] = []
+        needed_srcs: dict[int, MatchFragment] = {}
+        needed_dsts: dict[int, MatchFragment] = {}
+        for src in valid_srcs:
+            for dst in valid_dsts:
+                if (src.id, dst.id) in context.skip_pairs:
+                    continue
                 if not is_temporally_valid(src, dst):
                     continue
-                d_entry = dst_data.get(dst.id)
-                if not d_entry:
-                    continue
-                d_shingles, d_sig = d_entry
+                candidate_pairs.append((src, dst))
+                needed_srcs[src.id] = src
+                needed_dsts[dst.id] = dst
 
-                mh_sim = estimate_minhash_similarity(s_sig, d_sig)
-                jaccard, containment = exact_jaccard_and_containment(s_shingles, d_shingles)
-                effective_sim = max(mh_sim, 0.6 * jaccard + 0.4 * containment)
+        if not candidate_pairs:
+            return []
 
-                if effective_sim < self.min_similarity:
-                    continue
+        src_data: dict[int, tuple[set[str], tuple[int, ...]]] = {}
+        for src_id, src in needed_srcs.items():
+            sh = extract_shingles(src.norm or src.text, k=self.shingle_k)
+            if len(sh) >= 5:
+                src_data[src_id] = (sh, compute_minhash_signature(sh, self.num_perm))
 
-                rarity = context.rarity_weight(src.norm or src.hash)
-                score = round(min(0.85, (0.25 + 0.70 * effective_sim) * rarity), 4)
-                if score >= context.min_score:
-                    edges.append(
-                        CandidateEdge(
-                            src_frag=src.id,
-                            dst_frag=dst.id,
-                            kind="minhash",
-                            score=score,
-                            src_span=f"0:{src.len}(shingles={len(s_shingles)})",
-                            dst_span=f"0:{dst.len}(jaccard={jaccard:.2f},contain={containment:.2f})",
-                        )
+        dst_data: dict[int, tuple[set[str], tuple[int, ...]]] = {}
+        for dst_id, dst in needed_dsts.items():
+            sh = extract_shingles(dst.norm or dst.text, k=self.shingle_k)
+            if len(sh) >= 5:
+                dst_data[dst_id] = (sh, compute_minhash_signature(sh, self.num_perm))
+
+        for src, dst in candidate_pairs:
+            s_entry = src_data.get(src.id)
+            d_entry = dst_data.get(dst.id)
+            if not s_entry or not d_entry:
+                continue
+            s_shingles, s_sig = s_entry
+            d_shingles, d_sig = d_entry
+
+            if s_shingles.isdisjoint(d_shingles):
+                continue
+
+            mh_sim = estimate_minhash_similarity(s_sig, d_sig)
+            jaccard, containment = exact_jaccard_and_containment(s_shingles, d_shingles)
+            effective_sim = max(mh_sim, 0.6 * jaccard + 0.4 * containment)
+
+            if effective_sim < self.min_similarity:
+                continue
+
+            rarity = context.rarity_weight(src.norm or src.hash)
+            score = round(min(0.85, (0.25 + 0.70 * effective_sim) * rarity), 4)
+            if score >= context.min_score:
+                edges.append(
+                    CandidateEdge(
+                        src_frag=src.id,
+                        dst_frag=dst.id,
+                        kind="minhash",
+                        score=score,
+                        src_span=f"0:{src.len}(shingles={len(s_shingles)})",
+                        dst_span=f"0:{dst.len}(jaccard={jaccard:.2f},contain={containment:.2f})",
                     )
+                )
 
         return edges

@@ -62,17 +62,40 @@ class LabelRuleEngine:
     @classmethod
     def from_json_file(cls, path: str | Path) -> LabelRuleEngine:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Rules JSON root must be an object")
+        raw_rules = data.get("rules", [])
+        if not isinstance(raw_rules, list):
+            raise ValueError('Rules JSON "rules" field must be a list')
+        include_defaults = data.get("include_defaults", True)
+        if not isinstance(include_defaults, bool):
+            raise ValueError('Rules JSON "include_defaults" field must be a boolean')
+
         rules: list[ToolRoleRule] = []
-        for item in data.get("rules", []):
+        for idx, item in enumerate(raw_rules):
+            if not isinstance(item, dict):
+                raise ValueError(f"Rule at index {idx} must be an object")
+            server_pat = item.get("server", "*")
+            tool_pat = item.get("tool", "*")
+            role = item.get("role", "neutral")
+            raw_labels = item.get("labels", [])
+            if not isinstance(server_pat, str) or not isinstance(tool_pat, str):
+                raise ValueError(f"Rule at index {idx}: 'server' and 'tool' must be strings")
+            if role not in ("source", "sink", "neutral"):
+                raise ValueError(
+                    f"Rule at index {idx}: invalid role {role!r} (expected 'source', 'sink', or 'neutral')"
+                )
+            if not isinstance(raw_labels, list) or not all(isinstance(lbl, str) for lbl in raw_labels):
+                raise ValueError(f"Rule at index {idx}: 'labels' must be a list of strings")
             rules.append(
                 ToolRoleRule(
-                    server_pattern=item.get("server", "*"),
-                    tool_pattern=item.get("tool", "*"),
-                    role=item.get("role", "neutral"),
-                    labels=tuple(item.get("labels", [])),
+                    server_pattern=server_pat,
+                    tool_pattern=tool_pat,
+                    role=role,
+                    labels=tuple(raw_labels),
                 )
             )
-        if data.get("include_defaults", True):
+        if include_defaults:
             rules.extend(DEFAULT_TOOL_RULES)
         return cls(rules=rules)
 
@@ -81,28 +104,37 @@ class LabelRuleEngine:
         server_name: str,
         tool_name: str,
         explicit_roles: dict[tuple[str, str], str] | None = None,
+        prefer_rules: bool = False,
     ) -> tuple[str, list[str]]:
         """Determine the role ('source' | 'sink' | 'neutral') and labels for `(server_name, tool_name)`."""
-        role: str | None = None
+        explicit_role: str | None = None
         if explicit_roles:
-            role = explicit_roles.get((server_name, tool_name)) or explicit_roles.get(("*", tool_name))
+            explicit_role = explicit_roles.get((server_name, tool_name)) or explicit_roles.get(
+                ("*", tool_name)
+            )
 
+        rule_role: str | None = None
         matched_labels: list[str] = []
         for rule in self.rules:
             if rule.matches(server_name, tool_name):
-                if role is None:
-                    role = rule.role
+                if rule_role is None:
+                    rule_role = rule.role
                 for lbl in rule.labels:
                     if lbl not in matched_labels:
                         matched_labels.append(lbl)
 
-        return (role or "neutral"), matched_labels
+        if prefer_rules:
+            role = rule_role or explicit_role or "neutral"
+        else:
+            role = explicit_role or rule_role or "neutral"
+        return role, matched_labels
 
     def apply_to_session(
         self,
         store: FlowStore,
         session_id: str,
         persist_labels: bool = False,
+        prefer_rules: bool = False,
     ) -> dict[str, Any]:
         """
         Populate `tool_roles` and `labels` for all calls and fragments in `session_id`
@@ -110,6 +142,7 @@ class LabelRuleEngine:
 
         When `persist_labels=True`, sensitive `out` fragments (`secret:*`, `confidential:*`)
         are also registered in `persistent_fingerprints` (hash-only, no plaintext).
+        When `prefer_rules=True`, configured rules take precedence over previously stored `tool_roles`.
         """
         explicit_roles = store.get_tool_roles()
         calls: list[CallRow] = store.get_calls(session_id)
@@ -120,7 +153,10 @@ class LabelRuleEngine:
 
         for call in calls:
             role, rule_labels = self.resolve_role_and_labels(
-                call.server_name, call.tool, explicit_roles=explicit_roles
+                call.server_name,
+                call.tool,
+                explicit_roles=explicit_roles,
+                prefer_rules=prefer_rules,
             )
             store.set_tool_role(call.server_name, call.tool, role)
             role_counts[role] = role_counts.get(role, 0) + 1

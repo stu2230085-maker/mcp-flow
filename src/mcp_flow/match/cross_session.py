@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mcp_flow.derive.fragments import normalize_basic, sha256_hex
-from mcp_flow.labels.detectors import detect_secrets_in_text
+from mcp_flow.labels.detectors import detect_all_secrets_in_text
 from mcp_flow.match.base import is_informative_text, shannon_entropy
 from mcp_flow.store.db import FlowStore, FragmentRow, PersistentFingerprintRow
 
@@ -22,6 +22,9 @@ _SPAN_HASHABLE_SECRET_LABELS: frozenset[str] = frozenset(
         "secret:aws_key",
         "secret:jwt",
         "secret:bearer_token",
+        "secret:slack_token",
+        "secret:google_api_key",
+        "secret:stripe_key",
     }
 )
 
@@ -93,13 +96,14 @@ def _is_fragment_eligible_for_inherited_label(
 
 def _extract_secret_span_hashes(text: str) -> list[tuple[str, str, str, int]]:
     """
-    Extract `(label, raw_hash, norm_hash, length)` for self-contained secret spans embedded inside `text`.
+    Extract `(label, raw_hash, norm_hash, length)` for all self-contained secret spans embedded inside `text`.
     Never returns plaintext — only hashes and lengths.
     """
     if not text:
         return []
     results: list[tuple[str, str, str, int]] = []
-    for det in detect_secrets_in_text(text):
+    seen: set[tuple[str, str]] = set()
+    for det in detect_all_secrets_in_text(text):
         if det.label not in _SPAN_HASHABLE_SECRET_LABELS:
             continue
         try:
@@ -116,10 +120,15 @@ def _extract_secret_span_hashes(text: str) -> list[tuple[str, str, str, int]]:
         span_norm = normalize_basic(span_text)
         if not is_informative_text(span_text, span_norm):
             continue
+        raw_h = sha256_hex(span_text)
+        key = (det.label, raw_h)
+        if key in seen:
+            continue
+        seen.add(key)
         results.append(
             (
                 det.label,
-                sha256_hex(span_text),
+                raw_h,
                 sha256_hex(span_norm),
                 len(span_text),
             )

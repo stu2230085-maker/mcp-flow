@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import heapq
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,17 +57,26 @@ def find_hazardous_paths(
     sink_role: str = "sink",
     min_score: float = 0.35,
     max_depth: int = 8,
+    max_paths: int = 500,
 ) -> list[HazardousPath]:
     """
-    Enumerate all simple directed paths from labeled/source nodes to nodes with `role == sink_role`.
+    Enumerate simple directed paths from labeled/source nodes to nodes with `role == sink_role`.
     Each path is scored by the minimum edge score along the path (the weakest link).
+    Uses best-first search ordered by bottleneck score and caps output at `max_paths`
+    (pass `max_paths <= 0` for unlimited) to stay resilient on dense graphs.
     """
     results: list[HazardousPath] = []
-    source_nodes = [
-        node
-        for node in graph.nodes.values()
-        if _matches_source_criteria(node, source_label)
-    ]
+    source_nodes = sorted(
+        (
+            node
+            for node in graph.nodes.values()
+            if _matches_source_criteria(node, source_label)
+        ),
+        key=lambda n: n.call_id,
+    )
+
+    heap: list[tuple[float, int, int, int, list[CallNode], list[CallEdge]]] = []
+    counter = 0
 
     for start_node in source_nodes:
         cross_session_labels = [
@@ -85,51 +95,71 @@ def find_hazardous_paths(
                     source_labels=cross_session_labels,
                 )
             )
+            if max_paths > 0 and len(results) >= max_paths:
+                break
 
-        stack: list[tuple[int, list[CallNode], list[CallEdge]]] = [
-            (start_node.call_id, [start_node], [])
-        ]
-        while stack:
-            curr_id, path_nodes, path_edges = stack.pop()
-            curr_node = graph.nodes[curr_id]
+        counter += 1
+        heapq.heappush(heap, (-1.0, 0, start_node.call_id, counter, [start_node], []))
 
-            if path_edges and curr_node.role == sink_role:
-                weakest = min(path_edges, key=lambda e: e.max_score)
-                src_labels = list(start_node.labels)
-                for edge in path_edges:
-                    for ev in edge.evidences:
-                        for lbl in ev.labels:
-                            if lbl not in src_labels:
-                                src_labels.append(lbl)
-                results.append(
-                    HazardousPath(
-                        nodes=list(path_nodes),
-                        edges=list(path_edges),
-                        bottleneck_score=weakest.max_score,
-                        weakest_edge_id=weakest.edge_id,
-                        source_labels=src_labels or [f"role:{start_node.role}"],
-                    )
+    max_expansions = max(max_paths * 20, 10_000) if max_paths > 0 else 0
+    expansions = 0
+
+    while heap:
+        if max_paths > 0 and len(results) >= max_paths:
+            break
+        if max_expansions > 0 and expansions >= max_expansions:
+            break
+
+        neg_bottleneck, depth, start_cid, _, path_nodes, path_edges = heapq.heappop(heap)
+        expansions += 1
+        start_node = path_nodes[0]
+        curr_node = path_nodes[-1]
+
+        if path_edges and curr_node.role == sink_role:
+            weakest = min(path_edges, key=lambda e: e.max_score)
+            src_labels = list(start_node.labels)
+            for edge in path_edges:
+                for ev in edge.evidences:
+                    for lbl in ev.labels:
+                        if lbl not in src_labels:
+                            src_labels.append(lbl)
+            results.append(
+                HazardousPath(
+                    nodes=list(path_nodes),
+                    edges=list(path_edges),
+                    bottleneck_score=weakest.max_score,
+                    weakest_edge_id=weakest.edge_id,
+                    source_labels=src_labels or [f"role:{start_node.role}"],
                 )
+            )
+            if max_paths > 0 and len(results) >= max_paths:
+                break
 
-            if len(path_edges) >= max_depth:
+        if depth >= max_depth:
+            continue
+
+        visited_ids = {n.call_id for n in path_nodes}
+        for out_edge in graph.adjacency.get(curr_node.call_id, []):
+            if out_edge.max_score < min_score:
                 continue
-
-            visited_ids = {n.call_id for n in path_nodes}
-            for out_edge in graph.adjacency.get(curr_id, []):
-                if out_edge.max_score < min_score:
-                    continue
-                if out_edge.dst_call_id in visited_ids:
-                    continue
-                next_node = graph.nodes.get(out_edge.dst_call_id)
-                if next_node is None:
-                    continue
-                stack.append(
-                    (
-                        next_node.call_id,
-                        path_nodes + [next_node],
-                        path_edges + [out_edge],
-                    )
-                )
+            if out_edge.dst_call_id in visited_ids:
+                continue
+            next_node = graph.nodes.get(out_edge.dst_call_id)
+            if next_node is None:
+                continue
+            next_bottleneck = out_edge.max_score if not path_edges else min(-neg_bottleneck, out_edge.max_score)
+            counter += 1
+            heapq.heappush(
+                heap,
+                (
+                    -next_bottleneck,
+                    depth + 1,
+                    start_cid,
+                    counter,
+                    path_nodes + [next_node],
+                    path_edges + [out_edge],
+                ),
+            )
 
     results.sort(key=lambda p: (-p.bottleneck_score, len(p.edges), p.nodes[0].call_id))
     return results
