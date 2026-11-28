@@ -106,6 +106,7 @@ class MatchContext:
     total_calls: int = 1
     norm_call_freq: dict[str, int] = field(default_factory=dict)
     min_score: float = 0.35
+    skip_pairs: set[tuple[int, int]] = field(default_factory=set)
 
     @classmethod
     def from_fragments(

@@ -8,6 +8,20 @@ from mcp_flow.graph.builder import OBSERVATION_DISCLAIMER, FlowGraph
 from mcp_flow.graph.paths import HazardousPath
 
 
+def _escape_mermaid_text(text: str) -> str:
+    return text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace('"', "'")
+
+
+def _escape_dot_text(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r\n", " ")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+
 def to_mermaid(graph: FlowGraph, min_score: float = 0.0) -> str:
     """
     Render the call flow graph in Mermaid `graph LR` syntax.
@@ -22,14 +36,14 @@ def to_mermaid(graph: FlowGraph, min_score: float = 0.0) -> str:
     for cid in sorted(graph.nodes.keys()):
         node = graph.nodes[cid]
         label_suffix = f" [{','.join(node.labels)}]" if node.labels else ""
-        safe_title = f"{node.display_name} #{node.req_seq}{label_suffix}".replace('"', "'")
+        safe_title = _escape_mermaid_text(f"{node.display_name} #{node.req_seq}{label_suffix}")
         lines.append(f'  c{cid}["{safe_title}"]')
 
     for edge in graph.edges:
         if edge.max_score < min_score:
             continue
         extra = f" x{edge.match_count}" if edge.match_count > 1 else ""
-        edge_label = f"{edge.primary_kind} {edge.max_score:.2f}{extra}"
+        edge_label = _escape_mermaid_text(f"{edge.primary_kind} {edge.max_score:.2f}{extra}").replace("|", "/")
         lines.append(f"  c{edge.src_call_id} -->|{edge_label}| c{edge.dst_call_id}")
 
     return "\n".join(lines) + "\n"
@@ -50,14 +64,15 @@ def to_dot(graph: FlowGraph, min_score: float = 0.0) -> str:
             "sink": "#ffcdd2",
             "neutral": "#e3f2fd",
         }.get(node.role, "#ffffff")
-        safe_title = f"{node.display_name} #{node.req_seq}".replace('"', '\\"')
+        safe_title = _escape_dot_text(f"{node.display_name} #{node.req_seq}")
+        safe_role = _escape_dot_text(node.role)
         lines.append(
-            f'  c{cid} [label="{safe_title}\\nrole={node.role}", style="rounded,filled", fillcolor="{role_color}"];'
+            f'  c{cid} [label="{safe_title}\\nrole={safe_role}", style="rounded,filled", fillcolor="{role_color}"];'
         )
     for edge in graph.edges:
         if edge.max_score < min_score:
             continue
-        label = f"{edge.primary_kind} ({edge.max_score:.2f}, n={edge.match_count})"
+        label = _escape_dot_text(f"{edge.primary_kind} ({edge.max_score:.2f}, n={edge.match_count})")
         lines.append(f'  c{edge.src_call_id} -> c{edge.dst_call_id} [label="{label}"];')
     lines.append("}")
     return "\n".join(lines) + "\n"

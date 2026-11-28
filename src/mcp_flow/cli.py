@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -30,6 +31,7 @@ from mcp_flow.store.redaction import RedactionPolicy
 
 def _atomic_write_bytes(target: Path, data: bytes, mode: int) -> None:
     """Write *data* to a temp file in *target.parent* with *mode* and replace *target*."""
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     tmp_path = Path(tmp_name)
     try:
@@ -69,7 +71,12 @@ def analyze_session(
         if rules_path
         else LabelRuleEngine()
     )
-    rule_engine.apply_to_session(store, session_id, persist_labels=persist_labels)
+    rule_engine.apply_to_session(
+        store,
+        session_id,
+        persist_labels=persist_labels,
+        prefer_rules=bool(rules_path),
+    )
     if cross_session:
         match_cross_session_taint(store, session_id)
 
@@ -114,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--cross-session",
         action="store_true",
         help="Match input fragments against persistent fingerprints from earlier sessions",
+    )
+    p_analyze.add_argument(
+        "--hash-only",
+        action="store_true",
+        help="Store only fragment hashes and lengths during derivation (omitting plaintext text)",
     )
 
     # 3. report
@@ -235,10 +247,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mcp-flow wrap-config: {exc}", file=sys.stderr)
             return 2
 
-    redaction = RedactionPolicy.from_regex_strings(
-        getattr(args, "redact_pattern", []),
-        hash_only=getattr(args, "hash_only", False),
-    )
+    try:
+        redaction = RedactionPolicy.from_regex_strings(
+            getattr(args, "redact_pattern", []),
+            hash_only=getattr(args, "hash_only", False),
+        )
+    except re.error as exc:
+        print(f"mcp-flow: invalid --redact-pattern regex: {exc}", file=sys.stderr)
+        return 2
     store = FlowStore(db_path=args.db, redaction_policy=redaction)
     try:
         if args.subcommand == "proxy":
@@ -268,16 +284,20 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.subcommand == "analyze":
-            analyze_session(
-                store=store,
-                session_id=args.session,
-                max_stage=args.max_stage,
-                enable_semantic=args.enable_semantic,
-                min_score=args.min_score,
-                rules_path=args.rules,
-                persist_labels=args.persist_labels,
-                cross_session=args.cross_session,
-            )
+            try:
+                analyze_session(
+                    store=store,
+                    session_id=args.session,
+                    max_stage=args.max_stage,
+                    enable_semantic=args.enable_semantic,
+                    min_score=args.min_score,
+                    rules_path=args.rules,
+                    persist_labels=args.persist_labels,
+                    cross_session=args.cross_session,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"mcp-flow analyze: {exc}", file=sys.stderr)
+                return 2
             calls = store.get_calls(args.session)
             frags = store.get_fragments(args.session)
             flows = store.get_flows(args.session)
@@ -335,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
                     + "\n"
                 )
             if args.out:
-                Path(args.out).write_text(rendered, encoding="utf-8")
+                _atomic_write_bytes(Path(args.out), rendered.encode("utf-8"), 0o600)
             else:
                 sys.stdout.write(rendered)
             return 0
@@ -365,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 rendered = store.export_messages_jsonl(args.session)
             if args.out:
-                Path(args.out).write_text(rendered, encoding="utf-8")
+                _atomic_write_bytes(Path(args.out), rendered.encode("utf-8"), 0o600)
             else:
                 sys.stdout.write(rendered)
             return 0

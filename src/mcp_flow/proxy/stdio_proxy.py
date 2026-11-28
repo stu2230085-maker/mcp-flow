@@ -183,16 +183,27 @@ def run_stdio_proxy(
     c2s_thread.start()
     s2c_thread.start()
 
-    s2c_thread.join()
-    proc.wait()
-    c2s_thread.join(timeout=1.0)
     try:
-        proc.stdout.close()
-    except Exception:
-        pass
-
-    log_queue.put(None)
-    log_queue.join()
-    db_thread.join(timeout=2.0)
+        s2c_thread.join()
+        proc.wait()
+        c2s_thread.join(timeout=1.0)
+    except KeyboardInterrupt:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+        raise
+    finally:
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        log_queue.put(None)
+        log_queue.join()
+        db_thread.join(timeout=2.0)
 
     return int(proc.returncode or 0)

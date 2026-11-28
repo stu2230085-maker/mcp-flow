@@ -17,12 +17,14 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
     (
         "secret:api_key",
         "regex:openai_or_sk_key",
-        re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+        re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"),
     ),
     (
         "secret:github_token",
         "regex:github_pat",
-        re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{25,}\b"),
+        re.compile(
+            r"(?<![A-Za-z0-9_])(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{25,})(?![A-Za-z0-9_])"
+        ),
     ),
     (
         "secret:aws_key",
@@ -32,12 +34,29 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
     (
         "secret:jwt",
         "regex:jwt_token",
-        re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+        re.compile(
+            r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])"
+        ),
     ),
     (
         "secret:bearer_token",
         "regex:bearer_token",
-        re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}=*\b"),
+        re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}=*(?![A-Za-z0-9._~+/=-])"),
+    ),
+    (
+        "secret:slack_token",
+        "regex:slack_token",
+        re.compile(r"(?<![A-Za-z0-9_-])xox[baprs]-[0-9A-Za-z-]{16,}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "secret:google_api_key",
+        "regex:google_api_key",
+        re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
+    ),
+    (
+        "secret:stripe_key",
+        "regex:stripe_key",
+        re.compile(r"(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}(?![A-Za-z0-9_])"),
     ),
     (
         "secret:private_key",
@@ -57,16 +76,13 @@ SECRET_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
 ]
 
 
-def detect_secrets_in_text(text: str) -> list[SecretDetection]:
-    """Scan a fragment text and return all matched sensitive data labels."""
+def detect_all_secrets_in_text(text: str) -> list[SecretDetection]:
+    """Scan a fragment text and return every matched sensitive data span (including multiple per label)."""
     if not text:
         return []
     detections: list[SecretDetection] = []
-    seen_labels: set[str] = set()
     for label, detector_name, pattern in SECRET_PATTERNS:
-        m = pattern.search(text)
-        if m and label not in seen_labels:
-            seen_labels.add(label)
+        for m in pattern.finditer(text):
             detections.append(
                 SecretDetection(
                     label=label,
@@ -74,4 +90,17 @@ def detect_secrets_in_text(text: str) -> list[SecretDetection]:
                     span=f"{m.start()}:{m.end()}",
                 )
             )
+    return detections
+
+
+def detect_secrets_in_text(text: str) -> list[SecretDetection]:
+    """Scan a fragment text and return one detection per matched sensitive data label."""
+    if not text:
+        return []
+    detections: list[SecretDetection] = []
+    seen_labels: set[str] = set()
+    for det in detect_all_secrets_in_text(text):
+        if det.label not in seen_labels:
+            seen_labels.add(det.label)
+            detections.append(det)
     return detections

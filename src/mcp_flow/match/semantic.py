@@ -162,48 +162,32 @@ class SemanticMatcher(Matcher):
         if not valid_srcs or not valid_dsts:
             return []
 
-        if self.embedding_fn is not None:
-            dense_vecs: dict[int, list[float]] = {}
-            for frag in valid_srcs + valid_dsts:
-                if frag.id not in dense_vecs:
-                    dense_vecs[frag.id] = self.embedding_fn(frag.text)
-            for src in valid_srcs:
-                for dst in valid_dsts:
-                    if not is_temporally_valid(src, dst):
-                        continue
-                    cos = _cosine_dense(dense_vecs[src.id], dense_vecs[dst.id])
-                    if cos < self.min_cosine:
-                        continue
-                    rarity = context.rarity_weight(src.norm or src.hash)
-                    score = round(min(0.78, (0.20 + 0.65 * cos) * rarity), 4)
-                    if score >= context.min_score:
-                        edges.append(
-                            CandidateEdge(
-                                src_frag=src.id,
-                                dst_frag=dst.id,
-                                kind="semantic",
-                                score=score,
-                                src_span=f"0:{src.len}(embed)",
-                                dst_span=f"0:{dst.len}(cos={cos:.2f})",
-                            )
-                        )
-            return edges
-
-        # Default hybrid semantic feature vector similarity
-        feat_map: dict[int, Counter[str]] = {}
-        all_unique = {f.id: f for f in valid_srcs + valid_dsts}
-        for fid, frag in all_unique.items():
-            feat_map[fid] = _extract_semantic_features(frag.text)
-
+        candidate_pairs: list[tuple[MatchFragment, MatchFragment]] = []
+        needed_frags: dict[int, MatchFragment] = {}
         for src in valid_srcs:
             for dst in valid_dsts:
+                if (src.id, dst.id) in context.skip_pairs:
+                    continue
                 if not is_temporally_valid(src, dst):
                     continue
-                cos = _cosine_counter(feat_map[src.id], feat_map[dst.id])
+                candidate_pairs.append((src, dst))
+                needed_frags[src.id] = src
+                needed_frags[dst.id] = dst
+
+        if not candidate_pairs:
+            return []
+
+        if self.embedding_fn is not None:
+            dense_vecs: dict[int, list[float]] = {
+                fid: self.embedding_fn(frag.text)
+                for fid, frag in needed_frags.items()
+            }
+            for src, dst in candidate_pairs:
+                cos = _cosine_dense(dense_vecs[src.id], dense_vecs[dst.id])
                 if cos < self.min_cosine:
                     continue
                 rarity = context.rarity_weight(src.norm or src.hash)
-                score = round(min(0.75, (0.20 + 0.75 * cos) * rarity), 4)
+                score = round(min(0.78, (0.20 + 0.65 * cos) * rarity), 4)
                 if score >= context.min_score:
                     edges.append(
                         CandidateEdge(
@@ -211,9 +195,34 @@ class SemanticMatcher(Matcher):
                             dst_frag=dst.id,
                             kind="semantic",
                             score=score,
-                            src_span=f"0:{src.len}(tfidf)",
+                            src_span=f"0:{src.len}(embed)",
                             dst_span=f"0:{dst.len}(cos={cos:.2f})",
                         )
                     )
+            return edges
+
+        # Default hybrid semantic feature vector similarity
+        feat_map: dict[int, Counter[str]] = {
+            fid: _extract_semantic_features(frag.text)
+            for fid, frag in needed_frags.items()
+        }
+
+        for src, dst in candidate_pairs:
+            cos = _cosine_counter(feat_map[src.id], feat_map[dst.id])
+            if cos < self.min_cosine:
+                continue
+            rarity = context.rarity_weight(src.norm or src.hash)
+            score = round(min(0.75, (0.20 + 0.75 * cos) * rarity), 4)
+            if score >= context.min_score:
+                edges.append(
+                    CandidateEdge(
+                        src_frag=src.id,
+                        dst_frag=dst.id,
+                        kind="semantic",
+                        score=score,
+                        src_span=f"0:{src.len}(tfidf)",
+                        dst_span=f"0:{dst.len}(cos={cos:.2f})",
+                    )
+                )
 
         return edges

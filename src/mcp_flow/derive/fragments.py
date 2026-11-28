@@ -19,6 +19,11 @@ _IGNORED_LEAF_PATHS = {
     "$._meta",
 }
 
+_IGNORED_PATH_PREFIXES = (
+    "$._meta.",
+    "$._meta[",
+)
+
 
 def normalize_basic(text: str) -> str:
     """Normalize Unicode NFKC, collapse whitespace, strip, and case-fold."""
@@ -33,32 +38,49 @@ def sha256_hex(text: str) -> str:
 
 def _should_ignore_path(json_path: str) -> bool:
     normalized_path = re.sub(r"\[\d+\]", "[*]", json_path)
-    return normalized_path in _IGNORED_LEAF_PATHS
+    if normalized_path in _IGNORED_LEAF_PATHS:
+        return True
+    return normalized_path.startswith(_IGNORED_PATH_PREFIXES)
 
 
 def _iter_json_leaves(
     node: Any,
     path: str = "$",
     parse_embedded_json: bool = True,
+    max_json_depth: int = 2,
 ) -> list[tuple[str, str]]:
     """
     Recursively walk a JSON structure down to leaf strings/scalars.
     If a leaf string is itself a JSON object or array (common in MCP `content[0].text`),
-    emit both the outer string leaf and its inner JSON leaves.
+    emit both the outer string leaf and its inner JSON leaves up to `max_json_depth`.
     """
     leaves: list[tuple[str, str]] = []
     if isinstance(node, dict):
         for k, v in node.items():
             child_path = f"{path}.{k}"
-            leaves.extend(_iter_json_leaves(v, child_path, parse_embedded_json=parse_embedded_json))
+            leaves.extend(
+                _iter_json_leaves(
+                    v,
+                    child_path,
+                    parse_embedded_json=parse_embedded_json,
+                    max_json_depth=max_json_depth,
+                )
+            )
     elif isinstance(node, list):
         for idx, item in enumerate(node):
             child_path = f"{path}[{idx}]"
-            leaves.extend(_iter_json_leaves(item, child_path, parse_embedded_json=parse_embedded_json))
+            leaves.extend(
+                _iter_json_leaves(
+                    item,
+                    child_path,
+                    parse_embedded_json=parse_embedded_json,
+                    max_json_depth=max_json_depth,
+                )
+            )
     elif isinstance(node, str):
         if not _should_ignore_path(path) and node != "":
             leaves.append((path, node))
-            if parse_embedded_json:
+            if parse_embedded_json and max_json_depth > 0:
                 stripped = node.strip()
                 if (stripped.startswith("{") and stripped.endswith("}")) or (
                     stripped.startswith("[") and stripped.endswith("]")
@@ -66,11 +88,13 @@ def _iter_json_leaves(
                     try:
                         inner = json.loads(stripped)
                         if isinstance(inner, (dict, list)):
+                            next_depth = max_json_depth - 1
                             leaves.extend(
                                 _iter_json_leaves(
                                     inner,
                                     f"{path}$json",
-                                    parse_embedded_json=False,
+                                    parse_embedded_json=next_depth > 0,
+                                    max_json_depth=next_depth,
                                 )
                             )
                     except json.JSONDecodeError:

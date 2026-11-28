@@ -15,6 +15,23 @@ from mcp_flow.match.base import (
 )
 
 
+def _build_anchors(text: str, min_match_len: int) -> tuple[str, ...]:
+    """
+    Sample fixed-stride anchor substrings guaranteeing by pigeonhole principle that
+    any contiguous match of length >= `min_match_len` contains at least one anchor.
+    """
+    if len(text) < min_match_len:
+        return ()
+    anchor_len = max(1, min_match_len // 2)
+    stride = max(1, min_match_len - anchor_len + 1)
+    return tuple(
+        dict.fromkeys(
+            text[i : i + anchor_len]
+            for i in range(0, len(text) - anchor_len + 1, stride)
+        )
+    )
+
+
 class SubstringMatcher(Matcher):
     """Detects when a significant substring of an output fragment is embedded in a later input fragment."""
 
@@ -43,8 +60,23 @@ class SubstringMatcher(Matcher):
             if d.text and is_informative_text(d.text, d.norm, min_len=self.min_match_len)
         ]
 
+        if not valid_srcs or not valid_dsts:
+            return []
+
+        anchor_cache: dict[int, tuple[str, ...]] = {}
+        dst_seq_matchers: dict[int, SequenceMatcher[str]] = {}
+
+        def _get_anchors(frag: MatchFragment) -> tuple[str, ...]:
+            anchors = anchor_cache.get(frag.id)
+            if anchors is None:
+                anchors = _build_anchors(frag.text, self.min_match_len)
+                anchor_cache[frag.id] = anchors
+            return anchors
+
         for src in valid_srcs:
             for dst in valid_dsts:
+                if (src.id, dst.id) in context.skip_pairs:
+                    continue
                 if not is_temporally_valid(src, dst):
                     continue
                 if src.hash == dst.hash or (src.norm and src.norm == dst.norm):
@@ -67,8 +99,23 @@ class SubstringMatcher(Matcher):
                         dst_span = f"0:{match_len}"
                         matched_str = dst.text
                     else:
-                        # Case 3: longest contiguous common substring
-                        sm = SequenceMatcher(None, src.text, dst.text, autojunk=False)
+                        # Lossless pre-filter: sample anchors from the shorter string
+                        if len(src.text) <= len(dst.text):
+                            anchors = _get_anchors(src)
+                            haystack = dst.text
+                        else:
+                            anchors = _get_anchors(dst)
+                            haystack = src.text
+                        if not any(anchor in haystack for anchor in anchors):
+                            continue
+
+                        # Case 3: longest contiguous common substring (reusing b2j index per dst)
+                        sm = dst_seq_matchers.get(dst.id)
+                        if sm is None:
+                            sm = SequenceMatcher(None, src.text, dst.text, autojunk=False)
+                            dst_seq_matchers[dst.id] = sm
+                        else:
+                            sm.set_seq1(src.text)
                         block = sm.find_longest_match(0, len(src.text), 0, len(dst.text))
                         if block.size < self.min_match_len:
                             continue
